@@ -36,3 +36,22 @@ Package.resolved
 *.ipa
 *.dSYM.zip
 *.dSYM
+
+# Python / Windows build
+windows/__pycache__/
+windows/src/__pycache__/
+windows/**/*.py[cod]
+windows/**/*.pyo
+windows/**/*.pyd
+windows/dist/
+windows/build/
+windows/*.spec.bak
+windows/venv/
+windows/env/
+windows/.venv/
+
+# Windows runtime
+windows/*.log
+windows/*.tmp
+Thumbs.db
+desktop.ini
