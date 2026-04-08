@@ -76,10 +76,13 @@ class InstagramService {
         config.httpCookieStorage = HTTPCookieStorage.shared
         config.httpShouldSetCookies = true
         config.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br",
-            "Connection": "keep-alive"
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Connection": "keep-alive",
+            "sec-ch-ua": "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not-A.Brand\";v=\"99\"",
+            "sec-ch-ua-mobile": "?0",
+            "sec-ch-ua-platform": "\"macOS\""
         ]
         config.timeoutIntervalForRequest = 30
         self.session = URLSession(configuration: config)
@@ -113,11 +116,12 @@ class InstagramService {
         }
 
         var request = URLRequest(url: url)
-        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", forHTTPHeaderField: "Accept")
         request.setValue("document", forHTTPHeaderField: "Sec-Fetch-Dest")
         request.setValue("navigate", forHTTPHeaderField: "Sec-Fetch-Mode")
         request.setValue("none", forHTTPHeaderField: "Sec-Fetch-Site")
         request.setValue("?1", forHTTPHeaderField: "Sec-Fetch-User")
+        request.setValue("1", forHTTPHeaderField: "Upgrade-Insecure-Requests")
 
         do {
             let (_, response) = try await session.data(for: request)
@@ -166,8 +170,10 @@ class InstagramService {
     func resetSession() {
         sessionInitialized = false
         csrfToken = nil
+        // Only clear non-session cookies so the user doesn't have to log in again.
+        // Preserving sessionid allows re-initialization without a manual re-login.
         if let cookies = HTTPCookieStorage.shared.cookies {
-            for cookie in cookies where cookie.domain.contains("instagram.com") {
+            for cookie in cookies where cookie.domain.contains("instagram.com") && cookie.name != "sessionid" {
                 HTTPCookieStorage.shared.deleteCookie(cookie)
             }
         }
@@ -176,10 +182,12 @@ class InstagramService {
     // MARK: - Rate Limiting
 
     private func waitForRateLimit() async {
+        let jitter = Double.random(in: 0.3...1.8)
+        let effectiveInterval = minimumRequestInterval + jitter
         if let last = lastRequestTime {
             let elapsed = Date().timeIntervalSince(last)
-            if elapsed < minimumRequestInterval {
-                let delay = minimumRequestInterval - elapsed
+            if elapsed < effectiveInterval {
+                let delay = effectiveInterval - elapsed
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
@@ -193,11 +201,13 @@ class InstagramService {
         request.setValue(igAppId, forHTTPHeaderField: "X-IG-App-ID")
         request.setValue(csrfToken ?? "", forHTTPHeaderField: "X-CSRFToken")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
-        request.setValue("*/*", forHTTPHeaderField: "Accept")
+        request.setValue("application/json, text/javascript, */*; q=0.01", forHTTPHeaderField: "Accept")
         request.setValue(referer ?? "https://www.instagram.com/", forHTTPHeaderField: "Referer")
+        request.setValue("https://www.instagram.com", forHTTPHeaderField: "Origin")
         request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
         request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
         request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
+        request.setValue("1", forHTTPHeaderField: "dpr")
         return request
     }
 
