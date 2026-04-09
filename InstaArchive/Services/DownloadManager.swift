@@ -31,7 +31,6 @@ enum DownloadStatus: Equatable {
     case skipped
     case error(String)
 
-    /// Whether this is a "final" state that should publish to the UI immediately
     var isFinal: Bool {
         switch self {
         case .completed, .error, .skipped, .idle: return true
@@ -53,11 +52,10 @@ class DownloadManager: ObservableObject {
     var isRunning = false
     var currentActivity: String = ""
     var totalNewItems: Int = 0
-    /// Profiles currently being processed (for concurrent tracking)
     var activeUsernames: Set<String> = []
 
     // Throttle: publish at most every 300ms for transient states,
-    // but always publish immediately for final states (completed/error).
+    // but always publish immediately for final states.
     private var _uiDirty = false
     private var _publishTimer: Timer?
     private let _publishInterval: TimeInterval = 0.3
@@ -71,12 +69,13 @@ class DownloadManager: ObservableObject {
     private var downloadedIds: Set<String> = []
     private let mediaLock = NSLock()
 
-    /// Cancellation: per-profile tasks and a global stop flag
+    // Background queue for heavy I/O (validateIndex, saveIndex)
+    private let ioQueue = DispatchQueue(label: "com.instaarchive.io", qos: .utility)
+
     private var profileTasks: [String: Task<Void, Never>] = [:]
     private var checkAllTask: Task<Void, Never>?
     private var stopAllRequested = false
 
-    /// How many items to download before auto-saving the index
     private let saveInterval = 25
 
     private init() {
@@ -86,9 +85,6 @@ class DownloadManager: ObservableObject {
 
     // MARK: - Throttled UI Publishing
 
-    /// Call from MainActor after mutating any UI-visible state.
-    /// Final states (completed, error, idle) publish immediately;
-    /// transient states (checking, downloading) are batched.
     @MainActor
     private func notifyUI(immediate: Bool = false) {
         if immediate {
@@ -100,9 +96,7 @@ class DownloadManager: ObservableObject {
         if _publishTimer == nil {
             _publishTimer = Timer.scheduledTimer(withTimeInterval: _publishInterval, repeats: true) { [weak self] _ in
                 guard let self = self else { return }
-                Task { @MainActor in
-                    self._flushUI()
-                }
+                Task { @MainActor in self._flushUI() }
             }
             RunLoop.main.add(_publishTimer!, forMode: .common)
         }
@@ -119,38 +113,48 @@ class DownloadManager: ObservableObject {
         }
     }
 
+    // MARK: - Index Management
+
     private func rebuildIdIndex() {
         downloadedIds = Set(downloadedMedia.map { $0.instagramId })
     }
 
-    func validateIndex() {
-        mediaLock.lock()
-        let fm = FileManager.default
-        let beforeCount = downloadedMedia.count
-        downloadedMedia.removeAll { item in
-            guard let path = item.localPath else { return true }
-            return !fm.fileExists(atPath: path)
+    /// Validate the media index by pruning entries whose files no longer exist.
+    /// Runs entirely on a background queue — does NOT block the main thread.
+    private func validateIndexAsync() async {
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            ioQueue.async { [self] in
+                mediaLock.lock()
+                let fm = FileManager.default
+                let beforeCount = downloadedMedia.count
+                downloadedMedia.removeAll { item in
+                    guard let path = item.localPath else { return true }
+                    return !fm.fileExists(atPath: path)
+                }
+                let removed = beforeCount - downloadedMedia.count
+                if removed > 0 {
+                    log.info("Pruned \(removed) stale entries from media index", context: "index")
+                    rebuildIdIndex()
+                    storage.saveMediaIndex(downloadedMedia)
+                }
+                mediaLock.unlock()
+                cont.resume()
+            }
         }
-        let removed = beforeCount - downloadedMedia.count
-        if removed > 0 {
-            print("[InstaArchive] Pruned \(removed) stale entries from media index")
-            rebuildIdIndex()
-            storage.saveMediaIndex(downloadedMedia)
-        }
-        mediaLock.unlock()
     }
 
     func removeMediaIndex(for username: String) {
         mediaLock.lock()
         downloadedMedia.removeAll { $0.profileUsername == username }
         rebuildIdIndex()
-        storage.saveMediaIndex(downloadedMedia)
         mediaLock.unlock()
+        // Save on background
+        let snapshot = downloadedMedia
+        ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
     }
 
     // MARK: - Cancellation
 
-    /// Skip/cancel download for a specific profile
     func skipProfile(_ username: String) {
         profileTasks[username]?.cancel()
         profileTasks.removeValue(forKey: username)
@@ -165,7 +169,6 @@ class DownloadManager: ObservableObject {
         }
     }
 
-    /// Stop all running downloads
     func stopAll() {
         stopAllRequested = true
         checkAllTask?.cancel()
@@ -209,13 +212,21 @@ class DownloadManager: ObservableObject {
         let count = downloadedMedia.count
         mediaLock.unlock()
 
-        // Periodic save
         if count % saveInterval == 0 {
-            saveIndex()
+            saveIndexAsync()
         }
     }
 
-    private func saveIndex() {
+    /// Save the media index on a background queue — never blocks the calling thread.
+    private func saveIndexAsync() {
+        mediaLock.lock()
+        let snapshot = downloadedMedia
+        mediaLock.unlock()
+        ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
+    }
+
+    /// Save synchronously (only for final saves before returning from performCheck).
+    private func saveIndexSync() {
         mediaLock.lock()
         let snapshot = downloadedMedia
         mediaLock.unlock()
@@ -233,10 +244,34 @@ class DownloadManager: ObservableObject {
     func checkProfile(_ profile: Profile, profileStore: ProfileStore) {
         guard !activeUsernames.contains(profile.username) else { return }
 
-        let task = Task {
+        // Use .detached to guarantee we don't inherit MainActor context
+        let task = Task.detached(priority: .userInitiated) { [self] in
             await performCheck(profile, profileStore: profileStore)
         }
         profileTasks[profile.username] = task
+    }
+
+    /// Sync a batch of specific profiles (for multi-select).
+    /// Uses sequential processing with delays to avoid bot detection.
+    func checkProfiles(_ profiles: [Profile], profileStore: ProfileStore) {
+        let shuffled = profiles.shuffled()
+        checkAllTask = Task.detached(priority: .userInitiated) { [self] in
+            for (index, profile) in shuffled.enumerated() {
+                if stopAllRequested || Task.isCancelled { break }
+                await self.performCheck(profile, profileStore: profileStore)
+                if stopAllRequested || Task.isCancelled { break }
+                // Inter-profile delay for batches > 1
+                if shuffled.count > 1 && index < shuffled.count - 1 {
+                    let cooldown = Double.random(in: 20...60)
+                    try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
+                }
+            }
+            await MainActor.run {
+                self.isRunning = false
+                self.currentActivity = ""
+                self.notifyUI(immediate: true)
+            }
+        }
     }
 
     private func performCheck(_ profile: Profile, profileStore: ProfileStore) async {
@@ -246,12 +281,14 @@ class DownloadManager: ObservableObject {
             self.isRunning = true
             self.activeUsernames.insert(username)
             self.profileStatuses[username] = .checking
-            self.currentActivity = "Validating index for @\(username)..."
+            self.currentActivity = "Checking @\(username)..."
             self.notifyUI(immediate: true)
         }
 
         log.info("Starting check for @\(username)", context: "check")
-        validateIndex()
+
+        // Validate index on background — does NOT block main thread
+        await validateIndexAsync()
 
         do {
             try Task.checkCancellation()
@@ -294,7 +331,7 @@ class DownloadManager: ObservableObject {
                 throw error
             }
 
-            // 4. Stories (non-fatal — log warning on failure)
+            // 4. Stories (non-fatal)
             try Task.checkCancellation()
             if settings.downloadStories, !profileInfo.userId.isEmpty {
                 await MainActor.run {
@@ -303,19 +340,17 @@ class DownloadManager: ObservableObject {
                 }
                 do {
                     let stories = try await instagram.fetchStories(
-                        userId: profileInfo.userId,
-                        username: username
+                        userId: profileInfo.userId, username: username
                     )
                     allMedia.append(contentsOf: stories)
                     log.info("Found \(stories.count) stories for @\(username)", context: "check")
                 } catch {
-                    let msg = "Stories fetch failed for @\(username): \(error.localizedDescription)"
-                    log.warn(msg, context: "check")
+                    log.warn("Stories fetch failed for @\(username): \(error.localizedDescription)", context: "check")
                     warnings.append("Stories: \(error.localizedDescription)")
                 }
             }
 
-            // 5. Highlights (non-fatal — log warning on failure)
+            // 5. Highlights (non-fatal)
             try Task.checkCancellation()
             if settings.downloadHighlights, !profileInfo.userId.isEmpty {
                 await MainActor.run {
@@ -324,14 +359,12 @@ class DownloadManager: ObservableObject {
                 }
                 do {
                     let highlights = try await instagram.fetchHighlights(
-                        userId: profileInfo.userId,
-                        username: username
+                        userId: profileInfo.userId, username: username
                     )
                     allMedia.append(contentsOf: highlights)
                     log.info("Found \(highlights.count) highlights for @\(username)", context: "check")
                 } catch {
-                    let msg = "Highlights fetch failed for @\(username): \(error.localizedDescription)"
-                    log.warn(msg, context: "check")
+                    log.warn("Highlights fetch failed for @\(username): \(error.localizedDescription)", context: "check")
                     warnings.append("Highlights: \(error.localizedDescription)")
                 }
             }
@@ -358,7 +391,7 @@ class DownloadManager: ObservableObject {
                 }
             }
 
-            // Build a flat list of individual download jobs
+            // Build flat job list
             struct DownloadJob {
                 let media: DiscoveredMedia
                 let index: Int
@@ -376,12 +409,11 @@ class DownloadManager: ObservableObject {
                         ? "\(media.instagramId)_\(index)"
                         : media.instagramId
 
-                    // Skip already-indexed items
                     if isDownloaded(itemId) { continue }
 
                     let savePath = storage.savePath(for: media, username: username, index: index)
 
-                    // If file exists on disk but not in index, re-index it without downloading
+                    // Re-index files that exist on disk but not in index
                     if FileManager.default.fileExists(atPath: savePath.path) {
                         let fileSize = (try? FileManager.default.attributesOfItem(atPath: savePath.path)[.size] as? Int64) ?? 0
                         let mediaItem = MediaItem(
@@ -405,12 +437,9 @@ class DownloadManager: ObservableObject {
 
             let totalToDownload = jobs.count
             log.info("@\(username): \(totalToDownload) files to download", context: "download")
-            // Thread-safe counters for concurrent downloads
             let downloadedCounter = LockedCounter()
             let newItemCounter = LockedCounter()
             let failedCounter = LockedCounter()
-
-            // Download files concurrently — up to maxConcurrentFiles at a time
             let maxConcurrentFiles = settings.maxConcurrentFileDownloads
 
             try await withThrowingTaskGroup(of: Void.self) { group in
@@ -419,10 +448,9 @@ class DownloadManager: ObservableObject {
                 for job in jobs {
                     try Task.checkCancellation()
 
-                    // Throttle: wait for a slot if we've hit the concurrent limit
                     while launched - downloadedCounter.value >= maxConcurrentFiles {
                         try Task.checkCancellation()
-                        try await Task.sleep(nanoseconds: 50_000_000) // 50ms check
+                        try await Task.sleep(nanoseconds: 50_000_000)
                     }
 
                     launched += 1
@@ -456,27 +484,25 @@ class DownloadManager: ObservableObject {
 
                         let completed = downloadedCounter.increment()
 
-                        // Update progress — throttled by notifyUI()
-                        if completed % 3 == 0 || completed == totalToDownload {
+                        if completed % 5 == 0 || completed == totalToDownload {
                             let progress = Double(completed) / Double(totalToDownload)
                             await MainActor.run {
                                 self.profileStatuses[username] = .downloading(progress: progress)
                                 self.currentActivity = "Downloading @\(username) (\(completed)/\(totalToDownload))..."
-                                self.notifyUI()  // throttled, won't flood SwiftUI
+                                self.notifyUI()
                             }
                         }
                     }
                 }
 
-                // Wait for all downloads to finish
                 try await group.waitForAll()
             }
 
             let newItemCount = newItemCounter.value
             let failedCount = failedCounter.value
 
-            // Final save
-            saveIndex()
+            // Final save on background
+            saveIndexAsync()
 
             let finalNewItemCount = newItemCount
             if failedCount > 0 {
@@ -494,17 +520,13 @@ class DownloadManager: ObservableObject {
                     }
                     profileStore.saveAll()
                 }
-                if warnings.isEmpty {
-                    self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
-                } else {
-                    self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
-                }
+                self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
                 self.totalNewItems += finalNewItemCount
                 self.notifyUI(immediate: true)
             }
 
         } catch is CancellationError {
-            saveIndex()
+            saveIndexAsync()
             log.info("Download cancelled for @\(username)", context: "check")
             await MainActor.run {
                 if self.profileStatuses[username] != .skipped {
@@ -513,7 +535,7 @@ class DownloadManager: ObservableObject {
                 self.notifyUI(immediate: true)
             }
         } catch let error as InstagramError {
-            saveIndex()
+            saveIndexAsync()
             log.error("Check failed for @\(username): \(error.localizedDescription)", context: "check")
             if case .sessionError = error {
                 instagram.resetSession()
@@ -524,7 +546,7 @@ class DownloadManager: ObservableObject {
                 self.notifyUI(immediate: true)
             }
         } catch {
-            saveIndex()
+            saveIndexAsync()
             let msg = "\(error.localizedDescription)"
             log.error("Unexpected error for @\(username): \(msg)", context: "check")
             await MainActor.run {
@@ -544,43 +566,54 @@ class DownloadManager: ObservableObject {
         }
     }
 
-    // MARK: - Check all profiles (concurrent)
+    // MARK: - Check all profiles (sequential with anti-detection)
 
     func checkAllProfiles(profileStore: ProfileStore) {
         stopAllRequested = false
-        let activeProfiles = profileStore.profiles.filter { $0.isActive }
+        var activeProfiles = profileStore.profiles.filter { $0.isActive }
         guard !activeProfiles.isEmpty else { return }
 
-        checkAllTask = Task {
-            // Process up to maxConcurrent profiles at once
-            let maxConcurrent = settings.maxConcurrentDownloads
+        // Shuffle to avoid predictable ordering — a key bot signal
+        let shuffledProfiles = activeProfiles.shuffled()
 
-            await withTaskGroup(of: Void.self) { group in
-                var index = 0
-                var running = 0
+        checkAllTask = Task.detached(priority: .userInitiated) { [self] in
+            let activeProfiles = shuffledProfiles
+            // Mass sync: process ONE profile at a time with delays between them.
+            // Concurrent profile checks multiply API requests and are the #1
+            // trigger for Instagram's automated bot detection.
+            let batchSize = 10  // Profiles per batch before a longer cooldown
+            var completedInBatch = 0
 
-                for profile in activeProfiles {
-                    if stopAllRequested || Task.isCancelled { break }
+            for (index, profile) in activeProfiles.enumerated() {
+                if stopAllRequested || Task.isCancelled { break }
 
-                    // Wait for a slot to open up
-                    while running >= maxConcurrent {
-                        // Wait for one to finish
-                        await group.next()
-                        running -= 1
-                    }
-
-                    if stopAllRequested || Task.isCancelled { break }
-
-                    running += 1
-                    index += 1
-                    let p = profile
-                    group.addTask {
-                        await self.performCheck(p, profileStore: profileStore)
-                    }
+                await MainActor.run {
+                    self.currentActivity = "Queue: \(index + 1)/\(activeProfiles.count) — @\(profile.username)"
+                    self.notifyUI()
                 }
 
-                // Wait for remaining tasks
-                await group.waitForAll()
+                await self.performCheck(profile, profileStore: profileStore)
+                completedInBatch += 1
+
+                if stopAllRequested || Task.isCancelled { break }
+
+                // Inter-profile cooldown: random 20-60 seconds
+                if index < activeProfiles.count - 1 {
+                    let cooldown: Double
+                    if completedInBatch >= batchSize {
+                        // Batch cooldown: every 10 profiles, take a 3-7 minute break
+                        cooldown = Double.random(in: 180...420)
+                        completedInBatch = 0
+                        self.log.info("Batch cooldown: pausing \(Int(cooldown))s after \(batchSize) profiles", context: "rate")
+                        await MainActor.run {
+                            self.currentActivity = "Cooldown before next batch (\(Int(cooldown))s)..."
+                            self.notifyUI()
+                        }
+                    } else {
+                        cooldown = Double.random(in: 20...60)
+                    }
+                    try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
+                }
             }
 
             await MainActor.run {
@@ -593,10 +626,23 @@ class DownloadManager: ObservableObject {
 
     // MARK: - Query
 
+    /// Returns items for a profile. For large indexes, call from background.
     func mediaItems(for username: String) -> [MediaItem] {
         mediaLock.lock()
         defer { mediaLock.unlock() }
         return downloadedMedia.filter { $0.profileUsername == username }
+    }
+
+    /// Async variant that filters on a background queue — safe to call from UI.
+    func mediaItemsAsync(for username: String) async -> [MediaItem] {
+        await withCheckedContinuation { cont in
+            ioQueue.async { [self] in
+                mediaLock.lock()
+                let result = downloadedMedia.filter { $0.profileUsername == username }
+                mediaLock.unlock()
+                cont.resume(returning: result)
+            }
+        }
     }
 
     var totalDownloaded: Int {

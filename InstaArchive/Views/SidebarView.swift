@@ -1,20 +1,64 @@
 import SwiftUI
 
-/// Sidebar listing all tracked profiles
+/// Sort options for the profile list
+enum ProfileSortOption: String, CaseIterable {
+    case name = "Name"
+    case dateAdded = "Date Added"
+    case lastChecked = "Last Checked"
+    case lastNewContent = "Last Updated"
+    case itemCount = "Item Count"
+}
+
+/// Sidebar listing all tracked profiles with multi-select, sort, and context menus
 struct SidebarView: View {
     let profiles: [Profile]
     @Binding var selectedProfile: Profile?
+    @Binding var selectedProfileIds: Set<UUID>
     @Binding var searchText: String
+    @Binding var sortOption: ProfileSortOption
+    @Binding var sortAscending: Bool
     let onAdd: () -> Void
     let onCheckAll: () -> Void
     let onGoHome: () -> Void
+    let onSyncSelected: (Set<UUID>) -> Void
+    let onDeleteSelected: (Set<UUID>) -> Void
+    let onSetSchedule: (Set<UUID>, Int?) -> Void
 
     @EnvironmentObject var downloadManager: DownloadManager
+    @EnvironmentObject var profileStore: ProfileStore
+
+    private var sortedProfiles: [Profile] {
+        let sorted: [Profile]
+        switch sortOption {
+        case .name:
+            sorted = profiles.sorted { $0.username.localizedCaseInsensitiveCompare($1.username) == (sortAscending ? .orderedAscending : .orderedDescending) }
+        case .dateAdded:
+            sorted = profiles.sorted { sortAscending ? $0.dateAdded < $1.dateAdded : $0.dateAdded > $1.dateAdded }
+        case .lastChecked:
+            sorted = profiles.sorted {
+                let d0 = $0.lastChecked ?? .distantPast
+                let d1 = $1.lastChecked ?? .distantPast
+                return sortAscending ? d0 < d1 : d0 > d1
+            }
+        case .lastNewContent:
+            sorted = profiles.sorted {
+                let d0 = $0.lastNewContent ?? .distantPast
+                let d1 = $1.lastNewContent ?? .distantPast
+                return sortAscending ? d0 < d1 : d0 > d1
+            }
+        case .itemCount:
+            sorted = profiles.sorted { sortAscending ? $0.totalDownloaded < $1.totalDownloaded : $0.totalDownloaded > $1.totalDownloaded }
+        }
+        return sorted
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             // Home button
-            Button(action: onGoHome) {
+            Button(action: {
+                onGoHome()
+                selectedProfileIds.removeAll()
+            }) {
                 HStack(spacing: 8) {
                     Image(systemName: "house.fill")
                         .font(.system(size: 12))
@@ -27,8 +71,8 @@ struct SidebarView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .foregroundColor(selectedProfile == nil ? .accentColor : .primary)
-            .background(selectedProfile == nil ? Color.accentColor.opacity(0.1) : Color.clear)
+            .foregroundColor(selectedProfile == nil && selectedProfileIds.isEmpty ? .accentColor : .primary)
+            .background(selectedProfile == nil && selectedProfileIds.isEmpty ? Color.accentColor.opacity(0.1) : Color.clear)
             .cornerRadius(6)
             .padding(.horizontal, 8)
             .padding(.top, 8)
@@ -69,7 +113,58 @@ struct SidebarView: View {
             .background(Color(nsColor: .controlBackgroundColor))
             .cornerRadius(8)
             .padding(.horizontal, 12)
-            .padding(.bottom, 8)
+            .padding(.bottom, 4)
+
+            // Sort bar
+            HStack(spacing: 4) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 9))
+                    .foregroundColor(.secondary)
+                Picker("", selection: $sortOption) {
+                    ForEach(ProfileSortOption.allCases, id: \.self) { option in
+                        Text(option.rawValue).tag(option)
+                    }
+                }
+                .pickerStyle(.menu)
+                .labelsHidden()
+                .controlSize(.mini)
+                .frame(maxWidth: .infinity)
+                Button(action: { sortAscending.toggle() }) {
+                    Image(systemName: sortAscending ? "arrow.up" : "arrow.down")
+                        .font(.system(size: 9, weight: .medium))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help(sortAscending ? "Ascending" : "Descending")
+            }
+            .padding(.horizontal, 14)
+            .padding(.bottom, 6)
+
+            // Multi-select action bar
+            if !selectedProfileIds.isEmpty {
+                HStack(spacing: 6) {
+                    Text("\(selectedProfileIds.count) selected")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Button(action: { onSyncSelected(selectedProfileIds) }) {
+                        Image(systemName: "arrow.clockwise")
+                            .font(.system(size: 10))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Sync Selected")
+                    Button(action: { selectedProfileIds.removeAll() }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Clear Selection")
+                }
+                .padding(.horizontal, 14)
+                .padding(.vertical, 4)
+                .background(Color.accentColor.opacity(0.08))
+            }
 
             Divider()
 
@@ -90,13 +185,46 @@ struct SidebarView: View {
                 }
                 .frame(maxWidth: .infinity)
             } else {
-                List(selection: $selectedProfile) {
-                    ForEach(profiles) { profile in
-                        ProfileRowView(profile: profile)
-                            .tag(profile)
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(sortedProfiles) { profile in
+                            ProfileRowView(
+                                profile: profile,
+                                isSelected: selectedProfile?.id == profile.id,
+                                isMultiSelected: selectedProfileIds.contains(profile.id)
+                            )
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                if NSEvent.modifierFlags.contains(.command) {
+                                    // Cmd+click toggles multi-select
+                                    if selectedProfileIds.contains(profile.id) {
+                                        selectedProfileIds.remove(profile.id)
+                                    } else {
+                                        selectedProfileIds.insert(profile.id)
+                                    }
+                                } else if NSEvent.modifierFlags.contains(.shift), let current = selectedProfile {
+                                    // Shift+click selects range
+                                    let list = sortedProfiles
+                                    if let startIdx = list.firstIndex(where: { $0.id == current.id }),
+                                       let endIdx = list.firstIndex(where: { $0.id == profile.id }) {
+                                        let range = min(startIdx, endIdx)...max(startIdx, endIdx)
+                                        for i in range {
+                                            selectedProfileIds.insert(list[i].id)
+                                        }
+                                    }
+                                } else {
+                                    // Normal click — single select
+                                    selectedProfile = profile
+                                    selectedProfileIds.removeAll()
+                                }
+                            }
+                            .contextMenu {
+                                profileContextMenu(for: profile)
+                            }
+                        }
                     }
+                    .padding(.vertical, 4)
                 }
-                .listStyle(.sidebar)
             }
 
             Divider()
@@ -146,11 +274,64 @@ struct SidebarView: View {
             .padding(.vertical, 8)
         }
     }
+
+    // MARK: - Context Menu
+
+    @ViewBuilder
+    private func profileContextMenu(for profile: Profile) -> some View {
+        let isMulti = selectedProfileIds.count > 1 && selectedProfileIds.contains(profile.id)
+        let targetIds = isMulti ? selectedProfileIds : [profile.id]
+        let label = isMulti ? "\(targetIds.count) profiles" : "@\(profile.username)"
+
+        Button(action: { onSyncSelected(targetIds) }) {
+            Label("Sync \(label)", systemImage: "arrow.clockwise")
+        }
+
+        Divider()
+
+        Menu("Set Schedule") {
+            Button("Follow Global") { onSetSchedule(targetIds, nil) }
+            Divider()
+            Button("Every 1h") { onSetSchedule(targetIds, 1) }
+            Button("Every 6h") { onSetSchedule(targetIds, 6) }
+            Button("Every 12h") { onSetSchedule(targetIds, 12) }
+            Button("Every 24h") { onSetSchedule(targetIds, 24) }
+            Button("Every 48h") { onSetSchedule(targetIds, 48) }
+            Button("Every 7d") { onSetSchedule(targetIds, 168) }
+        }
+
+        Button(action: {
+            togglePause(targetIds)
+        }) {
+            let allActive = targetIds.allSatisfy { id in
+                profileStore.profiles.first(where: { $0.id == id })?.isActive ?? false
+            }
+            Label(allActive ? "Pause \(label)" : "Resume \(label)",
+                  systemImage: allActive ? "pause.circle" : "play.circle")
+        }
+
+        Divider()
+
+        Button(action: { onDeleteSelected(targetIds) }) {
+            Label("Remove \(label)", systemImage: "trash")
+        }
+    }
+
+    private func togglePause(_ ids: Set<UUID>) {
+        for id in ids {
+            if let idx = profileStore.profiles.firstIndex(where: { $0.id == id }) {
+                profileStore.profiles[idx].isActive.toggle()
+            }
+        }
+        profileStore.saveAll()
+    }
 }
 
 /// A single profile row in the sidebar
 struct ProfileRowView: View {
     let profile: Profile
+    let isSelected: Bool
+    let isMultiSelected: Bool
     @EnvironmentObject var downloadManager: DownloadManager
 
     private var isActive: Bool {
@@ -193,6 +374,13 @@ struct ProfileRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
+            // Multi-select indicator
+            if isMultiSelected {
+                Image(systemName: "checkmark.circle.fill")
+                    .font(.system(size: 12))
+                    .foregroundColor(.accentColor)
+            }
+
             // Profile pic placeholder
             ZStack {
                 Circle()
@@ -232,7 +420,17 @@ struct ProfileRowView: View {
             }
             statusIcon
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 6)
+                .fill(
+                    isSelected ? Color.accentColor.opacity(0.15) :
+                    isMultiSelected ? Color.accentColor.opacity(0.08) :
+                    Color.clear
+                )
+        )
+        .padding(.horizontal, 6)
     }
 }
 

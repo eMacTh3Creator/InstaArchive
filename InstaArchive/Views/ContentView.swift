@@ -5,9 +5,14 @@ struct ContentView: View {
     @EnvironmentObject var profileStore: ProfileStore
     @EnvironmentObject var downloadManager: DownloadManager
     @State private var selectedProfile: Profile?
+    @State private var selectedProfileIds: Set<UUID> = []
     @State private var showingAddProfile = false
     @State private var showingSettings = false
+    @State private var showingDeleteConfirmation = false
+    @State private var pendingDeleteIds: Set<UUID> = []
     @State private var searchText = ""
+    @State private var sortOption: ProfileSortOption = .name
+    @State private var sortAscending = true
 
     var filteredProfiles: [Profile] {
         if searchText.isEmpty {
@@ -24,10 +29,19 @@ struct ContentView: View {
             SidebarView(
                 profiles: filteredProfiles,
                 selectedProfile: $selectedProfile,
+                selectedProfileIds: $selectedProfileIds,
                 searchText: $searchText,
+                sortOption: $sortOption,
+                sortAscending: $sortAscending,
                 onAdd: { showingAddProfile = true },
                 onCheckAll: checkAll,
-                onGoHome: { selectedProfile = nil }
+                onGoHome: { selectedProfile = nil },
+                onSyncSelected: syncSelected,
+                onDeleteSelected: { ids in
+                    pendingDeleteIds = ids
+                    showingDeleteConfirmation = true
+                },
+                onSetSchedule: setSchedule
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
         } detail: {
@@ -55,7 +69,7 @@ struct ContentView: View {
                 Button(action: { selectedProfile = nil }) {
                     Image(systemName: "house")
                 }
-                .help("Home (⇧⌘H)")
+                .help("Home (\u{21E7}\u{2318}H)")
 
                 Button(action: { showingSettings = true }) {
                     Image(systemName: "gearshape")
@@ -66,14 +80,64 @@ struct ContentView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView()
         }
+        .alert("Remove Profiles", isPresented: $showingDeleteConfirmation) {
+            Button("Cancel", role: .cancel) {
+                pendingDeleteIds.removeAll()
+            }
+            Button("Keep Files", role: .destructive) {
+                deleteProfiles(pendingDeleteIds, deleteFiles: false)
+            }
+            Button("Delete Files", role: .destructive) {
+                deleteProfiles(pendingDeleteIds, deleteFiles: true)
+            }
+        } message: {
+            let count = pendingDeleteIds.count
+            let names = pendingDeleteIds.compactMap { id in
+                profileStore.profiles.first(where: { $0.id == id })?.username
+            }.map { "@\($0)" }.joined(separator: ", ")
+            Text("Remove \(count == 1 ? names : "\(count) profiles") from your archive?\n\n\u{2022} Keep Files \u{2014} removes from the app but keeps downloaded media on disk.\n\u{2022} Delete Files \u{2014} removes from the app and deletes all downloaded media.")
+        }
         .focusedSceneValue(\.selectedProfile, $selectedProfile)
         .focusedSceneValue(\.showingAddProfile, $showingAddProfile)
         .focusedSceneValue(\.showingSettings, $showingSettings)
         .focusedSceneValue(\.checkAllAction, checkAll)
     }
 
+    // MARK: - Actions
+
     private func checkAll() {
         downloadManager.checkAllProfiles(profileStore: profileStore)
+    }
+
+    private func syncSelected(_ ids: Set<UUID>) {
+        let profiles = profileStore.profiles.filter { ids.contains($0.id) }
+        downloadManager.checkProfiles(profiles, profileStore: profileStore)
+    }
+
+    private func setSchedule(_ ids: Set<UUID>, _ hours: Int?) {
+        for id in ids {
+            if let idx = profileStore.profiles.firstIndex(where: { $0.id == id }) {
+                profileStore.profiles[idx].customCheckIntervalHours = hours
+            }
+        }
+        profileStore.saveAll()
+    }
+
+    private func deleteProfiles(_ ids: Set<UUID>, deleteFiles: Bool) {
+        for id in ids {
+            if let profile = profileStore.profiles.first(where: { $0.id == id }) {
+                if deleteFiles {
+                    profileStore.removeProfileAndFiles(profile)
+                } else {
+                    profileStore.removeProfile(profile)
+                }
+            }
+        }
+        pendingDeleteIds.removeAll()
+        selectedProfileIds.removeAll()
+        if let sel = selectedProfile, ids.contains(sel.id) {
+            selectedProfile = nil
+        }
     }
 
     private func binding(for profile: Profile) -> Binding<Profile> {

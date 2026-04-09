@@ -12,12 +12,17 @@ struct ProfileDetailView: View {
     @State private var profileStorageSize: Int64 = 0
     var onDelete: (() -> Void)? = nil
 
-    /// Single query, cached in @State so SwiftUI doesn't re-filter 20K items on every body eval
+    /// Single query, cached in @State so SwiftUI doesn't re-filter 20K items on every body eval.
+    /// Uses async variant to avoid blocking the main thread for large indexes.
     private func refreshItemsIfNeeded() {
         let refreshId = "\(profile.username)-\(downloadManager.totalDownloaded)"
         guard refreshId != lastRefreshId else { return }
         lastRefreshId = refreshId
-        cachedItems = downloadManager.mediaItems(for: profile.username)
+        let username = profile.username
+        Task {
+            let items = await downloadManager.mediaItemsAsync(for: username)
+            cachedItems = items
+        }
         calculateStorageSize()
     }
 

@@ -62,9 +62,12 @@ class InstagramService {
     private let baseURL = "https://www.instagram.com"
     private let igAppId = "936619743392459"
 
-    // Rate limiting
+    // Rate limiting — thread-safe with lock
     private var lastRequestTime: Date?
-    private let minimumRequestInterval: TimeInterval = 2.5
+    private let rateLock = NSLock()
+    private let minimumRequestInterval: TimeInterval = 3.0
+    private var requestCount: Int = 0
+    private var hourWindowStart: Date = Date()
 
     // Session state
     private var csrfToken: String?
@@ -184,17 +187,62 @@ class InstagramService {
 
     // MARK: - Rate Limiting
 
+    /// Read and update rate limit state atomically. Returns (lastRequest, hourlyCount).
+    private func rateLimitState() -> (lastRequest: Date?, hourlyCount: Int) {
+        rateLock.lock()
+        defer { rateLock.unlock() }
+        let now = Date()
+        if now.timeIntervalSince(hourWindowStart) > 3600 {
+            requestCount = 0
+            hourWindowStart = now
+        }
+        requestCount += 1
+        let last = lastRequestTime
+        let count = requestCount
+        return (last, count)
+    }
+
+    /// Mark a request as sent (thread-safe).
+    private func markRequestSent() {
+        rateLock.lock()
+        lastRequestTime = Date()
+        rateLock.unlock()
+    }
+
+    /// Thread-safe rate limiter with human-like jitter and hourly budget.
+    /// Instagram's detection looks for: consistent intervals, high volume bursts,
+    /// and sustained request rates that no human would produce.
     private func waitForRateLimit() async {
-        let jitter = Double.random(in: 0.3...1.8)
+        // Human-like jitter: mix of short and occasional longer pauses
+        let roll = Double.random(in: 0...1)
+        let jitter: Double
+        if roll < 0.7 {
+            jitter = Double.random(in: 1.0...3.5)     // 70%: normal browsing pace
+        } else if roll < 0.92 {
+            jitter = Double.random(in: 3.5...8.0)     // 22%: slower / reading pause
+        } else {
+            jitter = Double.random(in: 8.0...15.0)    // 8%: long pause (distracted)
+        }
         let effectiveInterval = minimumRequestInterval + jitter
-        if let last = lastRequestTime {
+
+        let (last, currentCount) = rateLimitState()
+
+        // If approaching hourly limit, add progressive backoff
+        if currentCount > 180 {
+            let extraDelay = Double(currentCount - 180) * 2.0
+            log.warn("Approaching hourly request limit (\(currentCount)/200), adding \(Int(extraDelay))s cooldown", context: "rate")
+            try? await Task.sleep(nanoseconds: UInt64(extraDelay * 1_000_000_000))
+        }
+
+        if let last = last {
             let elapsed = Date().timeIntervalSince(last)
             if elapsed < effectiveInterval {
                 let delay = effectiveInterval - elapsed
                 try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             }
         }
-        lastRequestTime = Date()
+
+        markRequestSent()
     }
 
     // MARK: - Response Validation
