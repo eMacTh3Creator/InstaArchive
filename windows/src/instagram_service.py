@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 import requests
 
 from app_settings import AppSettings
+from logger import Logger
 
 # ---------------------------------------------------------------------------
 # Data models
@@ -65,6 +66,9 @@ class SessionError(InstagramError):
 BASE_URL = "https://www.instagram.com"
 APP_ID   = "936619743392459"
 
+# NOTE: Do NOT set Accept-Encoding here. The requests library handles
+# gzip/deflate/br decompression automatically; setting it manually can
+# cause issues with some edge cases.
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -72,7 +76,6 @@ HEADERS = {
         "Chrome/136.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Connection":      "keep-alive",
     "X-IG-App-ID":     APP_ID,
     "sec-ch-ua":          '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
@@ -96,6 +99,7 @@ class InstagramService:
         if self._initialized:
             return
         self._settings    = AppSettings()
+        self._log         = Logger()
         self._session     = requests.Session()
         self._session.headers.update(HEADERS)
         self._last_request_time: float = 0.0
@@ -125,9 +129,9 @@ class InstagramService:
                     self._csrf_token = csrf
                     self._session.headers["X-CSRFToken"] = csrf
                     self._session_ready = True
-                    print("[Instagram] Loaded saved cookies")
+                    self._log.info("Loaded saved cookies", context="session")
             except Exception as e:
-                print(f"[Instagram] Failed to load cookies: {e}")
+                self._log.error(f"Failed to load cookies: {e}", context="session")
 
     def save_cookies(self, cookies: list[dict]):
         """Called by the login flow with cookies captured from the browser."""
@@ -144,9 +148,9 @@ class InstagramService:
                 self._session.headers["X-CSRFToken"] = csrf
             self._session_ready = True
             self._settings.is_logged_in = True
-            print("[Instagram] Cookies saved and session ready")
+            self._log.info("Cookies saved and session ready", context="session")
         except Exception as e:
-            print(f"[Instagram] Failed to save cookies: {e}")
+            self._log.error(f"Failed to save cookies: {e}", context="session")
 
     def reset_session(self):
         self._session_ready = False
@@ -157,7 +161,7 @@ class InstagramService:
         if saved_session_id:
             self._session.cookies.set("sessionid", saved_session_id, domain=".instagram.com")
         self._settings.is_logged_in = False
-        print("[Instagram] Session reset (sessionid preserved)")
+        self._log.info("Session reset (sessionid preserved)", context="session")
 
     # ------------------------------------------------------------------
     # Rate limiting
@@ -202,23 +206,185 @@ class InstagramService:
         return resp
 
     # ------------------------------------------------------------------
+    # Response validation
+    # ------------------------------------------------------------------
+
+    def _validate_api_response(self, resp: requests.Response, context: str):
+        """Check if an API response is actually HTML instead of JSON.
+        Instagram returns HTML (login page, challenge, consent) with HTTP 200
+        when your session is invalid or they want additional verification."""
+        content_type = resp.headers.get("Content-Type", "")
+        is_html_content_type = "text/html" in content_type
+
+        # Also check the body — Instagram sometimes omits/lies about Content-Type
+        prefix = resp.text[:200] if resp.text else ""
+        looks_like_html = "<!DOCTYPE" in prefix or "<html" in prefix or "<head" in prefix
+
+        if not is_html_content_type and not looks_like_html:
+            return  # Looks like JSON, proceed normally
+
+        body = resp.text[:2000] if resp.text else ""
+        self._log.error(
+            f"{context}: Got HTML instead of JSON (Content-Type: {content_type}, {len(resp.content)} bytes)",
+            context="api",
+        )
+
+        # Detect specific Instagram pages
+        if "/accounts/login" in body or '"loginPage"' in body or '"LoginAndSignupPage"' in body:
+            self._log.error(f"{context}: Instagram redirected to login page — session is expired", context="api")
+            raise SessionError("Instagram session expired or blocked. Log out in Settings, then log back in.")
+
+        if "/challenge/" in body or '"challenge"' in body:
+            self._log.error(f"{context}: Instagram is requesting a challenge (suspicious login verification)", context="api")
+            raise InstagramError(
+                "Instagram requires verification. Open instagram.com in your browser, "
+                "complete any security checks, then try again."
+            )
+
+        if "consent" in body or "/privacy/checks/" in body:
+            self._log.error(f"{context}: Instagram is showing a consent/privacy screen", context="api")
+            raise InstagramError(
+                "Instagram requires you to accept updated terms. Open instagram.com in your browser, "
+                "accept the prompt, then try again."
+            )
+
+        if "/accounts/suspended/" in body:
+            raise InstagramError("This Instagram account appears to be suspended.")
+
+        # Generic HTML fallback
+        raise SessionError("Instagram session expired or blocked. Log out in Settings, then log back in.")
+
+    # ------------------------------------------------------------------
     # Profile info
     # ------------------------------------------------------------------
 
     def fetch_profile_info(self, username: str) -> ProfileInfo:
         url = f"{BASE_URL}/api/v1/users/web_profile_info/"
         resp = self._get(url, params={"username": username}, referer=f"{BASE_URL}/{username}/", is_api=True)
+
+        self._log.info(f"Profile info HTTP {resp.status_code} for @{username}", context="api")
+
+        # Detect HTML responses disguised as 200 OK
+        self._validate_api_response(resp, f"fetch_profile_info(@{username})")
+
         if resp.status_code == 429:
+            self._log.error(f"Rate limited fetching @{username} (429)", context="api")
             raise RateLimitedError("Rate limited")
         if resp.status_code in (401, 403):
-            raise SessionError("Session expired")
+            self._log.warn(
+                f"Auth failed for @{username} ({resp.status_code}), resetting session and retrying",
+                context="api",
+            )
+            self.reset_session()
+            return self._fetch_profile_info_retry(username)
+        if resp.status_code == 404:
+            self._log.error(f"Profile @{username} not found (404)", context="api")
+            raise InstagramError("Profile not found. Check the username and try again.")
         if resp.status_code != 200:
-            raise InstagramError(f"HTTP {resp.status_code}")
+            self._log.warn(
+                f"Unexpected HTTP {resp.status_code} for @{username}, trying page scrape fallback",
+                context="api",
+            )
+            return self._fetch_profile_info_from_page(username)
 
+        return self._parse_profile_info(resp, username)
+
+    def _fetch_profile_info_retry(self, username: str) -> ProfileInfo:
+        """Second attempt after session reset. On failure, throw SessionError."""
+        url = f"{BASE_URL}/api/v1/users/web_profile_info/"
+        resp = self._get(url, params={"username": username}, referer=f"{BASE_URL}/{username}/", is_api=True)
+
+        self._log.info(f"Profile info retry HTTP {resp.status_code} for @{username}", context="api")
+
+        self._validate_api_response(resp, f"fetch_profile_info_retry(@{username})")
+
+        if resp.status_code == 200:
+            return self._parse_profile_info(resp, username)
+
+        if resp.status_code in (401, 403):
+            self._log.error(
+                f"Auth still failing after session reset for @{username} — session may be expired",
+                context="api",
+            )
+            raise SessionError("Instagram session expired or blocked. Log out in Settings, then log back in.")
+
+        return self._fetch_profile_info_from_page(username)
+
+    def _fetch_profile_info_from_page(self, username: str) -> ProfileInfo:
+        """Fallback: scrape the profile HTML page for embedded JSON data."""
+        self._log.info(f"Falling back to page scrape for @{username}", context="api")
+
+        resp = self._get(f"{BASE_URL}/{username}/", referer=None, is_api=False)
+
+        self._log.info(
+            f"Page scrape HTTP {resp.status_code} for @{username} ({len(resp.content)} bytes)",
+            context="api",
+        )
+
+        if resp.status_code == 404:
+            raise InstagramError("Profile not found. Check the username and try again.")
+        if resp.status_code in (401, 403):
+            self._log.error(f"Instagram rejected page request for @{username}", context="api")
+            raise SessionError("Instagram session expired or blocked. Log out in Settings, then log back in.")
+
+        html = resp.text
+        if not html:
+            raise InstagramError("Could not decode profile page")
+
+        # Check if Instagram redirected to a login page
+        if '"loginPage"' in html or ("/accounts/login/" in html and "edge_owner" not in html):
+            self._log.error(
+                f"Instagram redirected to login page for @{username} — session expired",
+                context="api",
+            )
+            raise SessionError("Instagram session expired or blocked. Log out in Settings, then log back in.")
+
+        # Try to extract JSON from the page
+        patterns = [
+            r'window\._sharedData\s*=\s*({.+?});</script>',
+            r'"ProfilePage":\[({.+?})\]',
+            r'window\.__additionalDataLoaded\([^,]+,\s*({.+?})\);',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, html, re.DOTALL)
+            if match:
+                try:
+                    data = json.loads(match.group(1))
+                    user = None
+                    # Navigate various embedded structures
+                    if "entry_data" in data:
+                        pages = data.get("entry_data", {}).get("ProfilePage", [])
+                        if pages:
+                            user = pages[0].get("graphql", {}).get("user")
+                    if not user and "graphql" in data:
+                        user = data.get("graphql", {}).get("user")
+                    if not user and "user" in data:
+                        user = data.get("user")
+
+                    if user and isinstance(user, dict) and user.get("username"):
+                        return self._build_profile_info(user, username)
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        self._log.error(f"Could not extract profile data from page for @{username}", context="parse")
+        raise InstagramError("Could not extract profile data from Instagram page.")
+
+    def _parse_profile_info(self, resp: requests.Response, username: str) -> ProfileInfo:
+        """Parse JSON response from the web_profile_info API."""
         try:
             data = resp.json()
         except ValueError:
-            raise InstagramError("Instagram returned invalid JSON")
+            preview = resp.text[:500] if resp.text else "(empty)"
+            self._log.error(
+                f"API response is not valid JSON ({len(resp.content)} bytes). Preview: {preview}",
+                context="parse",
+            )
+            if "<" in preview:
+                raise SessionError("Instagram session expired or blocked. Log out in Settings, then log back in.")
+            raise InstagramError(
+                f"Instagram returned an unexpected response ({len(resp.content)} bytes). "
+                "Try logging out and back in."
+            )
 
         # Try multiple known response structures
         user = None
@@ -235,27 +401,56 @@ class InstagramService:
             status = data.get("status", "")
             message = data.get("message", "")
             top_keys = ", ".join(sorted(data.keys()))
+            self._log.error(
+                f"Unexpected API structure. status={status}, message={message}, keys=[{top_keys}]",
+                context="parse",
+            )
             if status == "fail" or message:
                 raise InstagramError(message or "Instagram rejected the request")
-            raise InstagramError(f"Unexpected API format. Keys: [{top_keys}]")
+            raise InstagramError(f"Instagram API changed format. Top-level keys: [{top_keys}].")
 
-        user_id = str(user.get("id") or user.get("pk") or "")
+        return self._build_profile_info(user, username)
 
-        try:
-            return ProfileInfo(
-                username=user.get("username", username),
-                full_name=user.get("full_name", ""),
-                biography=user.get("biography", ""),
-                profile_pic_url=user.get("profile_pic_url_hd") or user.get("profile_pic_url", ""),
-                is_private=user.get("is_private", False),
-                post_count=user.get("edge_owner_to_timeline_media", {}).get("count", 0)
-                    or user.get("media_count", 0),
-                follower_count=user.get("edge_followed_by", {}).get("count", 0)
-                    or user.get("follower_count", 0),
-                user_id=user_id,
-            )
-        except (KeyError, TypeError, ValueError) as e:
-            raise InstagramError(f"Failed to parse profile: {e}")
+    def _build_profile_info(self, user: dict, fallback_username: str) -> ProfileInfo:
+        """Build a ProfileInfo from a user dict (shared by API and page scrape paths)."""
+        username = user.get("username", fallback_username)
+
+        # User ID: handle int, int-as-string, or string
+        user_id = ""
+        for key in ("id", "pk"):
+            val = user.get(key)
+            if val is not None:
+                user_id = str(val)
+                if user_id:
+                    break
+
+        if user_id:
+            self._cached_user_ids[username] = user_id
+
+        # Post count: try both GraphQL and v1 API field names
+        post_count = (
+            user.get("edge_owner_to_timeline_media", {}).get("count", 0)
+            or user.get("media_count", 0)
+        )
+
+        # Follower count: try both field names
+        follower_count = (
+            user.get("edge_followed_by", {}).get("count", 0)
+            or user.get("follower_count", 0)
+        )
+
+        self._log.info(f"Parsed profile @{username} (id={user_id}, posts={post_count})", context="parse")
+
+        return ProfileInfo(
+            username=username,
+            full_name=user.get("full_name", ""),
+            biography=user.get("biography", ""),
+            profile_pic_url=user.get("profile_pic_url_hd") or user.get("profile_pic_url", ""),
+            is_private=user.get("is_private", False),
+            post_count=post_count,
+            follower_count=follower_count,
+            user_id=user_id,
+        )
 
     def get_user_id(self, username: str) -> str:
         if username in self._cached_user_ids:
@@ -321,6 +516,7 @@ class InstagramService:
                 break
             cursor = next_cursor
 
+        self._log.info(f"Fetched {len(all_media)} new media items for @{username}", context="api")
         return all_media
 
     def _fetch_page_v1(self, user_id: str, cursor: Optional[str]) -> tuple[list, Optional[str]]:
@@ -330,6 +526,7 @@ class InstagramService:
             params["max_id"] = cursor
         try:
             resp = self._get(url, params=params, referer=BASE_URL + "/", is_api=True)
+            self._log.info(f"v1 feed HTTP {resp.status_code} for user {user_id}", context="api")
             if resp.status_code != 200:
                 return [], None
             data = resp.json()
@@ -337,7 +534,7 @@ class InstagramService:
             next_cursor = data.get("next_max_id")
             return items, next_cursor
         except Exception as e:
-            print(f"[Instagram] v1 page fetch failed: {e}")
+            self._log.warn(f"v1 page fetch failed: {e}", context="api")
             return [], None
 
     def _fetch_page_graphql(self, username: str, cursor: Optional[str]) -> tuple[list, Optional[str]]:
@@ -352,6 +549,7 @@ class InstagramService:
                 referer=f"{BASE_URL}/{username}/",
                 is_api=True,
             )
+            self._log.info(f"GraphQL feed HTTP {resp.status_code} for @{username}", context="api")
             if resp.status_code != 200:
                 return [], None
             data = resp.json()
@@ -371,7 +569,7 @@ class InstagramService:
             next_cursor = page_info.get("end_cursor") if page_info.get("has_next_page") else None
             return nodes, next_cursor
         except Exception as e:
-            print(f"[Instagram] GraphQL page fetch failed: {e}")
+            self._log.warn(f"GraphQL page fetch failed: {e}", context="api")
             return [], None
 
     def _parse_media_node(self, node: dict, username: str) -> Optional[DiscoveredMedia]:
@@ -445,7 +643,7 @@ class InstagramService:
                 is_video=is_video,
             )
         except Exception as e:
-            print(f"[Instagram] Failed to parse media node: {e}")
+            self._log.warn(f"Failed to parse media node: {e}", context="parse")
             return None
 
     def _best_url(self, node: dict) -> Optional[str]:
@@ -480,8 +678,11 @@ class InstagramService:
         url = f"{BASE_URL}/api/v1/feed/user/{user_id}/story/"
         try:
             resp = self._get(url, referer=f"{BASE_URL}/{username}/", is_api=True)
+            self._log.info(f"Stories HTTP {resp.status_code} for @{username}", context="api")
             if resp.status_code != 200:
+                self._log.warn(f"Stories returned HTTP {resp.status_code} for @{username}", context="api")
                 return []
+            self._validate_api_response(resp, f"fetch_stories(@{username})")
             data = resp.json()
             reel = data.get("reel") or data.get("reels", {}).get(user_id, {})
             items = reel.get("items", []) if reel else []
@@ -490,9 +691,12 @@ class InstagramService:
                 media = self._parse_story_item(item, username)
                 if media:
                     results.append(media)
+            self._log.info(f"Found {len(results)} stories for @{username}", context="api")
             return results
+        except (SessionError, InstagramError):
+            raise
         except Exception as e:
-            print(f"[Instagram] Stories fetch failed: {e}")
+            self._log.warn(f"Stories fetch failed for @{username}: {e}", context="api")
             return []
 
     def _parse_story_item(self, item: dict, username: str) -> Optional[DiscoveredMedia]:
@@ -528,19 +732,24 @@ class InstagramService:
         for reel_id in reel_ids:
             items = self._fetch_highlight_items(reel_id, username)
             results.extend(items)
+        self._log.info(f"Found {len(results)} highlight items for @{username}", context="api")
         return results
 
     def _fetch_highlight_reel_ids(self, user_id: str, username: str) -> list[str]:
         url = f"{BASE_URL}/api/v1/highlights/{user_id}/highlights_tray/"
         try:
             resp = self._get(url, referer=f"{BASE_URL}/{username}/", is_api=True)
+            self._log.info(f"Highlights tray HTTP {resp.status_code} for @{username}", context="api")
             if resp.status_code != 200:
                 return []
+            self._validate_api_response(resp, f"fetch_highlights(@{username})")
             data = resp.json()
             tray = data.get("tray", [])
             return [str(r.get("id", "")) for r in tray if r.get("id")]
+        except (SessionError, InstagramError):
+            raise
         except Exception as e:
-            print(f"[Instagram] Highlight IDs fetch failed: {e}")
+            self._log.warn(f"Highlight IDs fetch failed for @{username}: {e}", context="api")
             return []
 
     def _fetch_highlight_items(self, reel_id: str, username: str) -> list[DiscoveredMedia]:
@@ -572,8 +781,10 @@ class InstagramService:
                         is_video=is_video,
                     ))
             return results
+        except (SessionError, InstagramError):
+            raise
         except Exception as e:
-            print(f"[Instagram] Highlight items fetch failed: {e}")
+            self._log.warn(f"Highlight items fetch failed: {e}", context="api")
             return []
 
     # ------------------------------------------------------------------

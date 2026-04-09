@@ -13,6 +13,7 @@ from typing import Optional
 from flask import Flask, request, jsonify, make_response, redirect, url_for, Response
 
 from app_settings import AppSettings
+from logger import Logger
 from storage_manager import StorageManager
 
 # Lazy imports to avoid circular deps at module level
@@ -30,6 +31,7 @@ app.secret_key = secrets.token_hex(32)
 
 _settings  = AppSettings()
 _storage   = StorageManager()
+_logger    = Logger()
 _sessions: set[str] = set()
 _sess_lock = threading.Lock()
 
@@ -314,6 +316,19 @@ def update_settings():
     updates = {k: v for k, v in data.items() if k in allowed}
     _settings.update(updates)
     return jsonify({"success": True})
+
+
+# ---------------------------------------------------------------------------
+# Logs API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/logs", methods=["GET"])
+def get_logs():
+    guard = _require_auth()
+    if guard:
+        return guard
+    entries = _logger.recent_entries(20)
+    return jsonify({"entries": entries, "log_directory": str(_logger.log_directory)})
 
 
 # ---------------------------------------------------------------------------

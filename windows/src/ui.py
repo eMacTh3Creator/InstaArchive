@@ -697,6 +697,21 @@ class SettingsPanel(QWidget):
         save_btn.setFixedWidth(200)
         save_btn.clicked.connect(self._save)
         root.addWidget(save_btn)
+        root.addSpacing(20)
+
+        # Folder buttons
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(10)
+        dl_folder_btn = QPushButton("Open Download Folder")
+        dl_folder_btn.setObjectName("ghost")
+        dl_folder_btn.clicked.connect(self._open_download_folder)
+        folder_row.addWidget(dl_folder_btn)
+        log_folder_btn = QPushButton("Open Log Folder")
+        log_folder_btn.setObjectName("ghost")
+        log_folder_btn.clicked.connect(self._open_log_folder)
+        folder_row.addWidget(log_folder_btn)
+        folder_row.addStretch()
+        root.addLayout(folder_row)
         root.addStretch()
 
     def load_settings(self):
@@ -740,6 +755,27 @@ class SettingsPanel(QWidget):
         self._workers.append(w)
         w.start()
         QMessageBox.information(self, "Settings", "Settings saved.")
+
+    def _open_download_folder(self):
+        path = self._path_edit.text() or str(PICTURES_DIR)
+        p = Path(path)
+        p.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(str(p))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+
+    def _open_log_folder(self):
+        log_dir = APPDATA_DIR / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(str(log_dir))
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(log_dir)])
+        else:
+            subprocess.Popen(["xdg-open", str(log_dir)])
 
 
 # ---------------------------------------------------------------------------

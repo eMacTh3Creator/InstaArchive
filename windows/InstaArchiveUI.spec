@@ -24,6 +24,7 @@ a = Analysis(
         ('src/thumbnail_cache.py', 'src'),
         ('src/scheduler.py', 'src'),
         ('src/web_server.py', 'src'),
+        ('src/logger.py', 'src'),
         ('src/tray_app.py', 'src'),
     ],
     hiddenimports=[

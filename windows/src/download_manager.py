@@ -10,7 +10,8 @@ from enum import Enum, auto
 from typing import Optional, Callable
 
 from app_settings import AppSettings
-from instagram_service import InstagramService, DiscoveredMedia, SessionError
+from instagram_service import InstagramService, DiscoveredMedia, SessionError, InstagramError
+from logger import Logger
 from storage_manager import StorageManager, MediaItem
 
 
@@ -65,6 +66,7 @@ class DownloadManager:
         self._settings   = AppSettings()
         self._instagram  = InstagramService()
         self._storage    = StorageManager()
+        self._log        = Logger()
 
         # State
         self._media_items: list[MediaItem]   = []
@@ -215,6 +217,7 @@ class DownloadManager:
 
     def _perform_check(self, profile: dict, profile_store, stop_flag: threading.Event):
         username = profile["username"]
+        self._log.info(f"Starting check for @{username}", context="download")
         self._set_status(username, ProfileStatus(kind=StatusKind.CHECKING))
         self.current_activity = f"Validating index for @{username}..."
         self.validate_index()
@@ -224,6 +227,7 @@ class DownloadManager:
                 raise InterruptedError()
 
             # 1. Profile info
+            self._log.info(f"Fetching profile info for @{username}", context="download")
             profile_info = self._instagram.fetch_profile_info(username)
             all_media: list[DiscoveredMedia] = []
 
@@ -239,19 +243,29 @@ class DownloadManager:
             posts = self._instagram.fetch_all_media(username, self.current_ids())
             all_media.extend(posts)
 
-            # 4. Stories
+            # 4. Stories — proper error handling, don't silently swallow failures
             if self._settings.download_stories and profile_info.user_id:
                 if not (stop_flag.is_set() or self._stop_all_flag.is_set()):
                     self.current_activity = f"Fetching stories for @{username}..."
-                    stories = self._instagram.fetch_stories(profile_info.user_id, username)
-                    all_media.extend(stories)
+                    try:
+                        stories = self._instagram.fetch_stories(profile_info.user_id, username)
+                        all_media.extend(stories)
+                    except (SessionError, InstagramError):
+                        raise
+                    except Exception as e:
+                        self._log.warn(f"Stories fetch failed for @{username}: {e} (continuing)", context="download")
 
-            # 5. Highlights
+            # 5. Highlights — proper error handling, don't silently swallow failures
             if self._settings.download_highlights and profile_info.user_id:
                 if not (stop_flag.is_set() or self._stop_all_flag.is_set()):
                     self.current_activity = f"Fetching highlights for @{username}..."
-                    highlights = self._instagram.fetch_highlights(profile_info.user_id, username)
-                    all_media.extend(highlights)
+                    try:
+                        highlights = self._instagram.fetch_highlights(profile_info.user_id, username)
+                        all_media.extend(highlights)
+                    except (SessionError, InstagramError):
+                        raise
+                    except Exception as e:
+                        self._log.warn(f"Highlights fetch failed for @{username}: {e} (continuing)", context="download")
 
             # Filter by type settings and dedup
             type_enabled = {
@@ -271,6 +285,11 @@ class DownloadManager:
                     for i in range(len(m.media_urls))
                 )
             ]
+
+            self._log.info(
+                f"@{username}: discovered {len(all_media)} total, {len(new_media)} new after filtering",
+                context="download",
+            )
 
             # Build flat job list
             jobs = []
@@ -309,7 +328,10 @@ class DownloadManager:
             total = len(jobs)
             completed_counter = _AtomicInt()
             new_item_counter  = _AtomicInt()
+            failed_counter    = _AtomicInt()
             max_workers = self._settings.max_concurrent_files
+
+            self._log.info(f"@{username}: downloading {total} files", context="download")
 
             def download_job(job):
                 if stop_flag.is_set() or self._stop_all_flag.is_set():
@@ -331,7 +353,8 @@ class DownloadManager:
                     self._record_download(item)
                     new_item_counter.increment()
                 except Exception as e:
-                    print(f"[DownloadManager] Failed {job['item_id']}: {e}")
+                    failed_counter.increment()
+                    self._log.warn(f"Failed to download {job['item_id']}: {e}", context="download")
                 finally:
                     done = completed_counter.increment()
                     if total > 0 and (done % 3 == 0 or done == total):
@@ -351,6 +374,7 @@ class DownloadManager:
 
             self._save_index()
             new_count = new_item_counter.value
+            fail_count = failed_counter.value
 
             # Update profile store
             if profile_store is not None:
@@ -358,18 +382,29 @@ class DownloadManager:
 
             with self._state_lock:
                 self.total_new_items += new_count
+
+            if fail_count > 0:
+                self._log.warn(
+                    f"@{username}: completed with {new_count} new, {fail_count} failed",
+                    context="download",
+                )
+            else:
+                self._log.info(f"@{username}: completed with {new_count} new items", context="download")
+
             self._set_status(username, ProfileStatus(kind=StatusKind.COMPLETED, new_items=new_count))
 
         except InterruptedError:
             self._save_index()
+            self._log.info(f"@{username}: skipped/cancelled", context="download")
             self._set_status(username, ProfileStatus(kind=StatusKind.SKIPPED))
         except SessionError as e:
             self._save_index()
+            self._log.error(f"@{username}: session error — {e}", context="download")
             self._instagram.reset_session()
             self._set_status(username, ProfileStatus(kind=StatusKind.ERROR, error_msg=str(e)))
         except Exception as e:
             self._save_index()
-            print(f"[DownloadManager] Error for @{username}: {e}")
+            self._log.error(f"@{username}: {e}", context="download")
             self._set_status(username, ProfileStatus(kind=StatusKind.ERROR, error_msg=str(e)))
         finally:
             with self._state_lock:
