@@ -25,7 +25,7 @@ enum InstagramError: LocalizedError {
         case .invalidURL:
             return "Invalid URL."
         case .sessionError:
-            return "Could not establish a session with Instagram. Try again later."
+            return "Instagram session expired or blocked. Log out in Settings, then log back in."
         }
     }
 }
@@ -195,6 +195,52 @@ class InstagramService {
         lastRequestTime = Date()
     }
 
+    // MARK: - Response Validation
+
+    /// Check if an API response is actually HTML instead of JSON.
+    /// Instagram returns HTML (login page, challenge, consent) with HTTP 200
+    /// when your session is invalid or they want additional verification.
+    private func validateAPIResponse(data: Data, response: HTTPURLResponse, context: String) throws {
+        let contentType = response.value(forHTTPHeaderField: "Content-Type") ?? ""
+
+        // If Content-Type says HTML, it's definitely not a JSON API response
+        let isHTMLContentType = contentType.contains("text/html")
+
+        // Also check the body — Instagram sometimes omits/lies about Content-Type
+        let prefix = String(data: data.prefix(200), encoding: .utf8) ?? ""
+        let looksLikeHTML = prefix.contains("<!DOCTYPE") || prefix.contains("<html") || prefix.contains("<head")
+
+        guard isHTMLContentType || looksLikeHTML else {
+            return // Looks like JSON, proceed normally
+        }
+
+        let body = String(data: data.prefix(2000), encoding: .utf8) ?? ""
+        log.error("\(context): Got HTML instead of JSON (Content-Type: \(contentType), \(data.count) bytes)", context: "api")
+
+        // Detect specific Instagram pages
+        if body.contains("/accounts/login") || body.contains("\"loginPage\"") || body.contains("\"LoginAndSignupPage\"") {
+            log.error("\(context): Instagram redirected to login page — session is expired", context: "api")
+            throw InstagramError.sessionError
+        }
+
+        if body.contains("/challenge/") || body.contains("\"challenge\"") {
+            log.error("\(context): Instagram is requesting a challenge (suspicious login verification)", context: "api")
+            throw InstagramError.parsingError("Instagram requires verification. Open instagram.com in your browser, complete any security checks, then try again.")
+        }
+
+        if body.contains("consent") || body.contains("/privacy/checks/") {
+            log.error("\(context): Instagram is showing a consent/privacy screen", context: "api")
+            throw InstagramError.parsingError("Instagram requires you to accept updated terms. Open instagram.com in your browser, accept the prompt, then try again.")
+        }
+
+        if body.contains("/accounts/suspended/") {
+            throw InstagramError.parsingError("This Instagram account appears to be suspended.")
+        }
+
+        // Generic HTML fallback
+        throw InstagramError.sessionError
+    }
+
     // MARK: - Common Request Builder
 
     private func makeAPIRequest(url: URL, referer: String? = nil) -> URLRequest {
@@ -232,6 +278,9 @@ class InstagramService {
         }
 
         log.info("Profile info HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
+
+        // Detect HTML responses disguised as 200 OK
+        try validateAPIResponse(data: data, response: httpResponse, context: "fetchProfileInfo(@\(username))")
 
         switch httpResponse.statusCode {
         case 200:
@@ -272,6 +321,8 @@ class InstagramService {
 
         log.info("Profile info retry HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
 
+        try validateAPIResponse(data: data, response: httpResponse, context: "fetchProfileInfoRetry(@\(username))")
+
         if httpResponse.statusCode == 200 {
             return try parseProfileInfo(from: data)
         }
@@ -287,9 +338,14 @@ class InstagramService {
     private func parseProfileInfo(from data: Data) throws -> InstagramProfileInfo {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             // Log raw response for debugging
-            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
-            log.error("API response is not valid JSON. Preview: \(preview)", context: "parse")
-            throw InstagramError.parsingError("Instagram returned invalid JSON")
+            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary data)"
+            log.error("API response is not valid JSON (\(data.count) bytes). Preview: \(preview)", context: "parse")
+
+            // Give a more helpful error depending on what we got
+            if preview.contains("<") {
+                throw InstagramError.sessionError
+            }
+            throw InstagramError.parsingError("Instagram returned an unexpected response (\(data.count) bytes). Try logging out and back in.")
         }
 
         // Try multiple known response structures
