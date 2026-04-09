@@ -285,29 +285,72 @@ class InstagramService {
     }
 
     private func parseProfileInfo(from data: Data) throws -> InstagramProfileInfo {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let userData = json["data"] as? [String: Any],
-              let user = userData["user"] as? [String: Any] else {
-            throw InstagramError.parsingError("Could not parse API profile response")
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            // Log raw response for debugging
+            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
+            log.error("API response is not valid JSON. Preview: \(preview)", context: "parse")
+            throw InstagramError.parsingError("Instagram returned invalid JSON")
+        }
+
+        // Try multiple known response structures
+        let user: [String: Any]
+        if let dataObj = json["data"] as? [String: Any],
+           let u = dataObj["user"] as? [String: Any] {
+            // Standard: {"data": {"user": {...}}}
+            user = u
+        } else if let u = json["user"] as? [String: Any] {
+            // Alternative: {"user": {...}}
+            user = u
+        } else if let graphql = json["graphql"] as? [String: Any],
+                  let u = graphql["user"] as? [String: Any] {
+            // Legacy GraphQL: {"graphql": {"user": {...}}}
+            user = u
+        } else if json["username"] != nil {
+            // Direct user object at top level
+            user = json
+        } else {
+            // Log the actual keys so we can diagnose
+            let topKeys = Array(json.keys).sorted().joined(separator: ", ")
+            let status = json["status"] as? String ?? "none"
+            let message = json["message"] as? String ?? json["spam"] as? String ?? ""
+            log.error("Unexpected API structure. status=\(status), message=\(message), keys=[\(topKeys)]", context: "parse")
+
+            if status == "fail" || !message.isEmpty {
+                let displayMsg = message.isEmpty ? "Instagram rejected the request (status: fail)" : message
+                throw InstagramError.parsingError(displayMsg)
+            }
+            throw InstagramError.parsingError("Instagram API changed format. Top-level keys: [\(topKeys)]. Check logs for details.")
         }
 
         let username = user["username"] as? String ?? ""
-        let userId = user["id"] as? String ?? user["pk"] as? String ?? ""
+        let userId: String = {
+            if let id = user["id"] as? String, !id.isEmpty { return id }
+            if let pk = user["pk"] as? Int64 { return String(pk) }
+            if let pk = user["pk"] as? String { return pk }
+            if let pk = user["pk"] as? Int { return String(pk) }
+            return ""
+        }()
         let fullName = user["full_name"] as? String ?? username
         let biography = user["biography"] as? String ?? ""
         let profilePicURL = user["profile_pic_url_hd"] as? String
             ?? user["profile_pic_url"] as? String ?? ""
         let isPrivate = user["is_private"] as? Bool ?? false
 
+        // Post count: try both GraphQL and v1 API field names
         let edgeOwner = user["edge_owner_to_timeline_media"] as? [String: Any]
-        let postCount = edgeOwner?["count"] as? Int ?? 0
+        let postCount = edgeOwner?["count"] as? Int
+            ?? user["media_count"] as? Int ?? 0
 
+        // Follower count: try both field names
         let edgeFollowers = user["edge_followed_by"] as? [String: Any]
-        let followerCount = edgeFollowers?["count"] as? Int ?? 0
+        let followerCount = edgeFollowers?["count"] as? Int
+            ?? user["follower_count"] as? Int ?? 0
 
         if !userId.isEmpty {
             cachedUserIds[username] = userId
         }
+
+        log.info("Parsed profile @\(username) (id=\(userId), posts=\(postCount))", context: "parse")
 
         return InstagramProfileInfo(
             username: username,
@@ -630,7 +673,7 @@ class InstagramService {
                 break
             }
             // If preferred strategy stopped working, fall through to try all
-            print("[InstaArchive] Preferred strategy '\(strategy)' stopped working, trying all")
+            log.warn("Preferred strategy '\(strategy)' stopped working, trying all", context: "media")
             workingStrategy = nil
         }
 
@@ -639,13 +682,13 @@ class InstagramService {
             let result = try await fetchMediaViaAPI(username: username, cursor: cursor)
             if !result.media.isEmpty {
                 workingStrategy = "v1"
-                print("[InstaArchive] v1 API returned \(result.media.count) items (hasMore: \(result.hasMore))")
+                log.info("v1 API: \(result.media.count) items for @\(username)", context: "media")
                 return result
             } else {
-                print("[InstaArchive] v1 API returned 0 items")
+                log.info("v1 API: 0 items for @\(username)", context: "media")
             }
         } catch {
-            print("[InstaArchive] v1 API failed: \(error.localizedDescription)")
+            log.warn("v1 API failed for @\(username): \(error.localizedDescription)", context: "media")
         }
 
         // Strategy 2: GraphQL
@@ -653,13 +696,13 @@ class InstagramService {
             let result = try await fetchMediaViaGraphQL(username: username, cursor: cursor)
             if !result.media.isEmpty {
                 workingStrategy = "graphql"
-                print("[InstaArchive] GraphQL returned \(result.media.count) items (hasMore: \(result.hasMore))")
+                log.info("GraphQL: \(result.media.count) items for @\(username)", context: "media")
                 return result
             } else {
-                print("[InstaArchive] GraphQL returned 0 items")
+                log.info("GraphQL: 0 items for @\(username)", context: "media")
             }
         } catch {
-            print("[InstaArchive] GraphQL failed: \(error.localizedDescription)")
+            log.warn("GraphQL failed for @\(username): \(error.localizedDescription)", context: "media")
         }
 
         // Strategy 3: HTML scraping + per-post fetching (first page only)
@@ -667,7 +710,7 @@ class InstagramService {
             let result = try await fetchMediaFromProfilePage(username: username)
             if !result.media.isEmpty {
                 workingStrategy = "html"
-                print("[InstaArchive] HTML scraping returned \(result.media.count) items")
+                log.info("HTML scrape: \(result.media.count) items for @\(username)", context: "media")
                 return result
             }
         }
@@ -1683,15 +1726,28 @@ class InstagramService {
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
         let (data, _) = try await session.data(for: request)
 
-        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let userData = json["data"] as? [String: Any],
-           let user = userData["user"] as? [String: Any],
-           let userId = user["id"] as? String ?? user["pk"] as? String {
-            cachedUserIds[username] = userId
-            return userId
+        if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            // Try all known response shapes
+            let userObj: [String: Any]? =
+                (json["data"] as? [String: Any])?["user"] as? [String: Any]
+                ?? json["user"] as? [String: Any]
+                ?? (json["graphql"] as? [String: Any])?["user"] as? [String: Any]
+                ?? (json["username"] != nil ? json : nil)
+
+            if let user = userObj {
+                let userId: String? = user["id"] as? String
+                    ?? (user["pk"] as? Int64).map(String.init)
+                    ?? (user["pk"] as? Int).map(String.init)
+                    ?? user["pk"] as? String
+                if let uid = userId, !uid.isEmpty {
+                    cachedUserIds[username] = uid
+                    return uid
+                }
+            }
         }
 
-        throw InstagramError.parsingError("Could not resolve user ID for @\(username)")
+        log.error("Could not resolve user ID for @\(username)", context: "api")
+        throw InstagramError.parsingError("Could not resolve user ID for @\(username). You may need to log in again.")
     }
 
     // MARK: - Download Media File

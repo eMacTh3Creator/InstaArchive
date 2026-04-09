@@ -217,18 +217,44 @@ class InstagramService:
 
         try:
             data = resp.json()
-            user = data["data"]["user"]
+        except ValueError:
+            raise InstagramError("Instagram returned invalid JSON")
+
+        # Try multiple known response structures
+        user = None
+        if "data" in data and isinstance(data.get("data"), dict):
+            user = data["data"].get("user")
+        if not user and "user" in data and isinstance(data.get("user"), dict):
+            user = data["user"]
+        if not user and "graphql" in data:
+            user = data.get("graphql", {}).get("user")
+        if not user and "username" in data:
+            user = data
+
+        if not user or not isinstance(user, dict):
+            status = data.get("status", "")
+            message = data.get("message", "")
+            top_keys = ", ".join(sorted(data.keys()))
+            if status == "fail" or message:
+                raise InstagramError(message or "Instagram rejected the request")
+            raise InstagramError(f"Unexpected API format. Keys: [{top_keys}]")
+
+        user_id = str(user.get("id") or user.get("pk") or "")
+
+        try:
             return ProfileInfo(
                 username=user.get("username", username),
                 full_name=user.get("full_name", ""),
                 biography=user.get("biography", ""),
                 profile_pic_url=user.get("profile_pic_url_hd") or user.get("profile_pic_url", ""),
                 is_private=user.get("is_private", False),
-                post_count=user.get("edge_owner_to_timeline_media", {}).get("count", 0),
-                follower_count=user.get("edge_followed_by", {}).get("count", 0),
-                user_id=user.get("id", ""),
+                post_count=user.get("edge_owner_to_timeline_media", {}).get("count", 0)
+                    or user.get("media_count", 0),
+                follower_count=user.get("edge_followed_by", {}).get("count", 0)
+                    or user.get("follower_count", 0),
+                user_id=user_id,
             )
-        except (KeyError, ValueError) as e:
+        except (KeyError, TypeError, ValueError) as e:
             raise InstagramError(f"Failed to parse profile: {e}")
 
     def get_user_id(self, username: str) -> str:
