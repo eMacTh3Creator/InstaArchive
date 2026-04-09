@@ -42,9 +42,12 @@ struct ContentView: View {
         }
         .frame(minWidth: 700, minHeight: 480)
         .sheet(isPresented: $showingAddProfile) {
-            AddProfileView { profile in
+            AddProfileView { profile, startSync in
                 profileStore.addProfile(profile)
                 selectedProfile = profile
+                if startSync {
+                    downloadManager.checkProfile(profile, profileStore: profileStore)
+                }
             }
         }
         .toolbar {

@@ -154,6 +154,7 @@ struct ProfileDetailView: View {
                     if profileStorageSize > 0 {
                         Label(StorageManager.formatBytes(profileStorageSize), systemImage: "externaldrive")
                     }
+                    Label(scheduleLabel, systemImage: "calendar.badge.clock")
                 }
                 .font(.system(size: 11))
                 .foregroundColor(.secondary)
@@ -195,6 +196,27 @@ struct ProfileDetailView: View {
                 }
 
                 HStack(spacing: 8) {
+                    // Per-profile schedule picker
+                    Picker("", selection: Binding<Int>(
+                        get: { profile.customCheckIntervalHours ?? -1 },
+                        set: { newValue in
+                            profile.customCheckIntervalHours = newValue == -1 ? nil : newValue
+                            profileStore.saveAll()
+                        }
+                    )) {
+                        Text("Follow Global").tag(-1)
+                        Divider()
+                        Text("Every 1h").tag(1)
+                        Text("Every 6h").tag(6)
+                        Text("Every 12h").tag(12)
+                        Text("Every 24h").tag(24)
+                        Text("Every 48h").tag(48)
+                        Text("Every 7d").tag(168)
+                    }
+                    .frame(width: 140)
+                    .controlSize(.small)
+                    .help("Check schedule for this profile")
+
                     Button(action: toggleActive) {
                         Label(
                             profile.isActive ? "Pause" : "Resume",
@@ -291,6 +313,21 @@ struct ProfileDetailView: View {
     }
 
     // MARK: - Actions
+
+    private var scheduleLabel: String {
+        if let custom = profile.customCheckIntervalHours {
+            switch custom {
+            case 1: return "Every 1h"
+            case 6: return "Every 6h"
+            case 12: return "Every 12h"
+            case 24: return "Every 24h"
+            case 48: return "Every 48h"
+            case 168: return "Every 7d"
+            default: return "Every \(custom)h"
+            }
+        }
+        return "Global (\(AppSettings.shared.checkIntervalHours)h)"
+    }
 
     private var isDownloadingThisProfile: Bool {
         let status = downloadManager.profileStatuses[profile.username] ?? .idle

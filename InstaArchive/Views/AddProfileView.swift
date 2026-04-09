@@ -8,7 +8,7 @@ struct AddProfileView: View {
     @State private var errorMessage: String?
     @State private var profileInfo: InstagramProfileInfo?
 
-    let onAdd: (Profile) -> Void
+    let onAdd: (Profile, Bool) -> Void  // (profile, startSync)
 
     var cleanUsername: String {
         var clean = username.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -98,7 +98,10 @@ struct AddProfileView: View {
                         .disabled(cleanUsername.isEmpty || isLoading)
                         .keyboardShortcut(.defaultAction)
                 } else {
-                    Button("Add to Queue") { addProfile() }
+                    Button("Add to Queue") { addProfile(startSync: false) }
+                        .buttonStyle(.bordered)
+
+                    Button("Add & Sync") { addProfile(startSync: true) }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
                 }
@@ -191,7 +194,7 @@ struct AddProfileView: View {
         }
     }
 
-    private func addProfile() {
+    private func addProfile(startSync: Bool) {
         guard let info = profileInfo else { return }
 
         let profile = Profile(
@@ -200,7 +203,7 @@ struct AddProfileView: View {
             profilePicURL: info.profilePicURL,
             bio: info.biography
         )
-        onAdd(profile)
+        onAdd(profile, startSync)
         dismiss()
     }
 }

@@ -12,6 +12,8 @@ struct Profile: Identifiable, Codable, Hashable {
     var lastNewContent: Date?
     var totalDownloaded: Int
     var dateAdded: Date
+    /// Per-profile check interval in hours. nil = follow global setting.
+    var customCheckIntervalHours: Int?
 
     init(
         id: UUID = UUID(),
@@ -23,7 +25,8 @@ struct Profile: Identifiable, Codable, Hashable {
         lastChecked: Date? = nil,
         lastNewContent: Date? = nil,
         totalDownloaded: Int = 0,
-        dateAdded: Date = Date()
+        dateAdded: Date = Date(),
+        customCheckIntervalHours: Int? = nil
     ) {
         self.id = id
         self.username = username.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -35,6 +38,20 @@ struct Profile: Identifiable, Codable, Hashable {
         self.lastNewContent = lastNewContent
         self.totalDownloaded = totalDownloaded
         self.dateAdded = dateAdded
+        self.customCheckIntervalHours = customCheckIntervalHours
+    }
+
+    /// Effective check interval for this profile (uses global if no custom override)
+    func effectiveCheckIntervalHours() -> Int {
+        customCheckIntervalHours ?? AppSettings.shared.checkIntervalHours
+    }
+
+    /// Whether this profile is due for a check based on its schedule
+    func isDue() -> Bool {
+        guard isActive else { return false }
+        guard let lastChecked = lastChecked else { return true }  // never checked = due now
+        let intervalSeconds = TimeInterval(effectiveCheckIntervalHours() * 3600)
+        return Date().timeIntervalSince(lastChecked) >= intervalSeconds
     }
 }
 
