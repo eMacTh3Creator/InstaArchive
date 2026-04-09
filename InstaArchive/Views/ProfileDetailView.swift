@@ -48,6 +48,35 @@ struct ProfileDetailView: View {
             // Profile header
             profileHeader
 
+            // Error banner (if last check failed)
+            if case .error(let message) = downloadManager.profileStatuses[profile.username] ?? .idle {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 12))
+                    Text(message)
+                        .font(.system(size: 12))
+                        .foregroundColor(.primary)
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                    Spacer()
+                    Button("Retry") { checkNow() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.mini)
+                    Button(action: { downloadManager.clearStatus(for: profile.username) }) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(12)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(8)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 8)
+            }
+
             Divider()
 
             // Filter bar

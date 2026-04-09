@@ -28,6 +28,7 @@
 		AA000019 /* InstagramLoginView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000021 /* InstagramLoginView.swift */; };
 		AA000020 /* ThumbnailCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000022 /* ThumbnailCache.swift */; };
 		AA000021 /* WebServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000023 /* WebServer.swift */; };
+		AA000022 /* Logger.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000024 /* Logger.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -54,6 +55,7 @@
 		AB000021 /* InstagramLoginView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstagramLoginView.swift; sourceTree = "<group>"; };
 		AB000022 /* ThumbnailCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailCache.swift; sourceTree = "<group>"; };
 		AB000023 /* WebServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebServer.swift; sourceTree = "<group>"; };
+		AB000024 /* Logger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Logger.swift; sourceTree = "<group>"; };
 		AC000001 /* InstaArchive.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = InstaArchive.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -126,6 +128,7 @@
 				AB000016 /* SchedulerService.swift */,
 				AB000022 /* ThumbnailCache.swift */,
 				AB000023 /* WebServer.swift */,
+				AB000024 /* Logger.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -235,6 +238,7 @@
 			AA000019 /* InstagramLoginView.swift in Sources */,
 			AA000020 /* ThumbnailCache.swift in Sources */,
 			AA000021 /* WebServer.swift in Sources */,
+			AA000022 /* Logger.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

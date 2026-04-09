@@ -235,6 +235,10 @@ struct SettingsView: View {
                     NSWorkspace.shared.open(URL(fileURLWithPath: settings.downloadPath))
                 }
                 .controlSize(.small)
+                Button("Open Log Folder") {
+                    NSWorkspace.shared.open(Logger.shared.logDirectory)
+                }
+                .controlSize(.small)
                 Spacer()
                 Button("Done") { dismiss() }
                     .buttonStyle(.borderedProminent)

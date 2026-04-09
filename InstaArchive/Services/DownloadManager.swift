@@ -46,6 +46,7 @@ class DownloadManager: ObservableObject {
     private let instagram = InstagramService.shared
     private let storage = StorageManager.shared
     private let settings = AppSettings.shared
+    private let log = Logger.shared
 
     private var downloadedMedia: [MediaItem] = []
     private var downloadedIds: Set<String> = []
@@ -192,55 +193,86 @@ class DownloadManager: ObservableObject {
             self.currentActivity = "Validating index for @\(username)..."
         }
 
+        log.info("Starting check for @\(username)", context: "check")
         validateIndex()
 
         do {
             try Task.checkCancellation()
 
-            let profileInfo = try await instagram.fetchProfileInfo(username: username)
-            var allMedia: [DiscoveredMedia] = []
+            // 1. Fetch profile info
+            log.info("Fetching profile info for @\(username)", context: "check")
+            let profileInfo: InstagramProfileInfo
+            do {
+                profileInfo = try await instagram.fetchProfileInfo(username: username)
+                log.info("Got profile info: \(profileInfo.postCount) posts, userId=\(profileInfo.userId)", context: "check")
+            } catch {
+                log.error("Failed to fetch profile info for @\(username): \(error.localizedDescription)", context: "check")
+                throw error
+            }
 
-            // 1. Profile picture
+            var allMedia: [DiscoveredMedia] = []
+            var warnings: [String] = []
+
+            // 2. Profile picture
             if let profilePicMedia = instagram.makeProfilePicMedia(profileInfo: profileInfo) {
                 allMedia.append(profilePicMedia)
             }
 
-            // 2. Posts with full pagination
+            // 3. Posts with full pagination
             try Task.checkCancellation()
             await MainActor.run {
                 self.currentActivity = "Fetching posts for @\(username)..."
             }
-            let posts = try await instagram.fetchAllMedia(
-                username: username,
-                knownIds: currentKnownIds()
-            )
-            allMedia.append(contentsOf: posts)
+            log.info("Fetching posts for @\(username)", context: "check")
+            do {
+                let posts = try await instagram.fetchAllMedia(
+                    username: username,
+                    knownIds: currentKnownIds()
+                )
+                allMedia.append(contentsOf: posts)
+                log.info("Found \(posts.count) posts for @\(username)", context: "check")
+            } catch {
+                log.error("Failed to fetch posts for @\(username): \(error.localizedDescription)", context: "check")
+                throw error
+            }
 
-            // 3. Stories
+            // 4. Stories (non-fatal — log warning on failure)
             try Task.checkCancellation()
             if settings.downloadStories, !profileInfo.userId.isEmpty {
                 await MainActor.run {
                     self.currentActivity = "Fetching stories for @\(username)..."
                 }
-                if let stories = try? await instagram.fetchStories(
-                    userId: profileInfo.userId,
-                    username: username
-                ) {
+                do {
+                    let stories = try await instagram.fetchStories(
+                        userId: profileInfo.userId,
+                        username: username
+                    )
                     allMedia.append(contentsOf: stories)
+                    log.info("Found \(stories.count) stories for @\(username)", context: "check")
+                } catch {
+                    let msg = "Stories fetch failed for @\(username): \(error.localizedDescription)"
+                    log.warn(msg, context: "check")
+                    warnings.append("Stories: \(error.localizedDescription)")
                 }
             }
 
-            // 4. Highlights
+            // 5. Highlights (non-fatal — log warning on failure)
             try Task.checkCancellation()
             if settings.downloadHighlights, !profileInfo.userId.isEmpty {
                 await MainActor.run {
                     self.currentActivity = "Fetching highlights for @\(username)..."
                 }
-                if let highlights = try? await instagram.fetchHighlights(
-                    userId: profileInfo.userId,
-                    username: username
-                ) {
+                do {
+                    let highlights = try await instagram.fetchHighlights(
+                        userId: profileInfo.userId,
+                        username: username
+                    )
                     allMedia.append(contentsOf: highlights)
+                    log.info("Found \(highlights.count) highlights for @\(username)", context: "check")
+                } catch {
+                    let msg = "Highlights fetch failed for @\(username): \(error.localizedDescription)"
+                    log.warn(msg, context: "check")
+                    warnings.append("Highlights: \(error.localizedDescription)")
                 }
             }
 
@@ -312,9 +344,11 @@ class DownloadManager: ObservableObject {
             }
 
             let totalToDownload = jobs.count
+            log.info("@\(username): \(totalToDownload) files to download", context: "download")
             // Thread-safe counters for concurrent downloads
             let downloadedCounter = LockedCounter()
             let newItemCounter = LockedCounter()
+            let failedCounter = LockedCounter()
 
             // Download files concurrently — up to maxConcurrentFiles at a time
             let maxConcurrentFiles = settings.maxConcurrentFileDownloads
@@ -356,7 +390,8 @@ class DownloadManager: ObservableObject {
                         } catch is CancellationError {
                             throw CancellationError()
                         } catch {
-                            print("Failed to download media \(job.itemId): \(error)")
+                            failedCounter.increment()
+                            self.log.warn("Failed to download \(job.itemId): \(error.localizedDescription)", context: "download")
                         }
 
                         let completed = downloadedCounter.increment()
@@ -377,11 +412,17 @@ class DownloadManager: ObservableObject {
             }
 
             let newItemCount = newItemCounter.value
+            let failedCount = failedCounter.value
 
             // Final save
             saveIndex()
 
             let finalNewItemCount = newItemCount
+            if failedCount > 0 {
+                warnings.append("\(failedCount) file\(failedCount == 1 ? "" : "s") failed to download")
+            }
+
+            log.info("@\(username) complete: \(finalNewItemCount) new, \(failedCount) failed", context: "check")
 
             await MainActor.run {
                 if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
@@ -392,13 +433,18 @@ class DownloadManager: ObservableObject {
                     }
                     profileStore.saveAll()
                 }
-                self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
+                if warnings.isEmpty {
+                    self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
+                } else {
+                    // Completed with warnings — show as completed but log the warnings
+                    self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
+                }
                 self.totalNewItems += finalNewItemCount
             }
 
         } catch is CancellationError {
             saveIndex()
-            print("[InstaArchive] Download cancelled for @\(username)")
+            log.info("Download cancelled for @\(username)", context: "check")
             await MainActor.run {
                 if self.profileStatuses[username] != .skipped {
                     self.profileStatuses[username] = .skipped
@@ -406,7 +452,7 @@ class DownloadManager: ObservableObject {
             }
         } catch let error as InstagramError {
             saveIndex()
-            print("[InstaArchive] Error checking @\(username): \(error.localizedDescription)")
+            log.error("Check failed for @\(username): \(error.localizedDescription)", context: "check")
             if case .sessionError = error {
                 instagram.resetSession()
                 await MainActor.run { AppSettings.shared.isLoggedIn = false }
@@ -416,9 +462,10 @@ class DownloadManager: ObservableObject {
             }
         } catch {
             saveIndex()
-            print("[InstaArchive] Unexpected error checking @\(username): \(error)")
+            let msg = "\(error.localizedDescription)"
+            log.error("Unexpected error for @\(username): \(msg)", context: "check")
             await MainActor.run {
-                self.profileStatuses[username] = .error(error.localizedDescription)
+                self.profileStatuses[username] = .error(msg)
             }
         }
 

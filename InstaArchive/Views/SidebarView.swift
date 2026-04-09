@@ -182,10 +182,11 @@ struct ProfileRowView: View {
                 Image(systemName: "forward.fill")
                     .foregroundColor(.secondary)
                     .font(.system(size: 10))
-            case .error:
+            case .error(let message):
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundColor(.orange)
                     .font(.system(size: 11))
+                    .help(message)
             }
         }
     }

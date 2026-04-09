@@ -56,6 +56,7 @@ struct DiscoveredMedia {
 /// Service for interacting with Instagram's public web interface
 class InstagramService {
     static let shared = InstagramService()
+    private let log = Logger.shared
 
     private let session: URLSession
     private let baseURL = "https://www.instagram.com"
@@ -157,7 +158,7 @@ class InstagramService {
             sessionInitialized = true
             print("[InstaArchive] Session initialized, CSRF: \(csrfToken != nil ? "yes" : "no"), authenticated: \(isAuthenticated)")
         } catch {
-            print("[InstaArchive] Failed to initialize session: \(error)")
+            log.error("Session init failed: \(error.localizedDescription)", context: "session")
             throw InstagramError.sessionError
         }
     }
@@ -230,20 +231,24 @@ class InstagramService {
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
-        print("[InstaArchive] Profile info response status: \(httpResponse.statusCode)")
+        log.info("Profile info HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
 
         switch httpResponse.statusCode {
         case 200:
             break
         case 404:
+            log.error("Profile @\(username) not found (404)", context: "api")
             throw InstagramError.profileNotFound
         case 429:
+            log.error("Rate limited fetching @\(username) (429)", context: "api")
             throw InstagramError.rateLimited
         case 401, 403:
+            log.warn("Auth failed for @\(username) (\(httpResponse.statusCode)), resetting session and retrying", context: "api")
             resetSession()
             try await ensureSession()
             return try await fetchProfileInfoRetry(username: username)
         default:
+            log.warn("Unexpected HTTP \(httpResponse.statusCode) for @\(username), trying page scrape fallback", context: "api")
             return try await fetchProfileInfoFromPage(username: username)
         }
 
@@ -265,8 +270,15 @@ class InstagramService {
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
+        log.info("Profile info retry HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
+
         if httpResponse.statusCode == 200 {
             return try parseProfileInfo(from: data)
+        }
+
+        if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+            log.error("Auth still failing after session reset for @\(username) — session may be expired", context: "api")
+            throw InstagramError.sessionError
         }
 
         return try await fetchProfileInfoFromPage(username: username)
@@ -313,6 +325,7 @@ class InstagramService {
 
     private func fetchProfileInfoFromPage(username: String) async throws -> InstagramProfileInfo {
         await waitForRateLimit()
+        log.info("Falling back to page scrape for @\(username)", context: "api")
 
         let urlString = "\(baseURL)/\(username)/"
         guard let url = URL(string: urlString) else {
@@ -320,9 +333,12 @@ class InstagramService {
         }
 
         var request = URLRequest(url: url)
-        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", forHTTPHeaderField: "Accept")
         request.setValue("document", forHTTPHeaderField: "Sec-Fetch-Dest")
         request.setValue("navigate", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("none", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("?1", forHTTPHeaderField: "Sec-Fetch-User")
+        request.setValue("1", forHTTPHeaderField: "Upgrade-Insecure-Requests")
 
         let (data, response) = try await session.data(for: request)
 
@@ -330,25 +346,42 @@ class InstagramService {
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
+        log.info("Page scrape HTTP \(httpResponse.statusCode) for @\(username) (\(data.count) bytes)", context: "api")
+
         if httpResponse.statusCode == 404 {
             throw InstagramError.profileNotFound
+        }
+
+        if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
+            log.error("Instagram rejected page request for @\(username) — login may be required", context: "api")
+            throw InstagramError.sessionError
         }
 
         guard let html = String(data: data, encoding: .utf8) else {
             throw InstagramError.parsingError("Could not decode profile page")
         }
 
+        // Check if Instagram redirected to a login page
+        if html.contains("\"loginPage\"") || html.contains("/accounts/login/") && !html.contains("\"edge_owner") {
+            log.error("Instagram redirected to login page for @\(username) — session expired or not logged in", context: "api")
+            throw InstagramError.sessionError
+        }
+
         if let info = try? extractFromJsonLD(html: html, username: username) {
+            log.info("Extracted profile data from JSON-LD for @\(username)", context: "api")
             return info
         }
         if let info = try? extractFromAdditionalData(html: html, username: username) {
+            log.info("Extracted profile data from embedded JSON for @\(username)", context: "api")
             return info
         }
         if let info = try? extractFromMetaTags(html: html, username: username) {
+            log.info("Extracted profile data from meta tags for @\(username)", context: "api")
             return info
         }
 
-        throw InstagramError.parsingError("Could not extract profile data from page")
+        log.error("All page scraping methods failed for @\(username) — page may have changed format", context: "api")
+        throw InstagramError.parsingError("Could not extract profile data. Instagram may have changed their page format, or you may need to log in.")
     }
 
     private func extractFromJsonLD(html: String, username: String) throws -> InstagramProfileInfo {
