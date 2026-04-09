@@ -76,10 +76,12 @@ class InstagramService {
         config.httpCookieAcceptPolicy = .always
         config.httpCookieStorage = HTTPCookieStorage.shared
         config.httpShouldSetCookies = true
+        // NOTE: Do NOT set Accept-Encoding here. URLSession handles gzip/deflate
+        // decompression automatically, but ONLY if you don't override Accept-Encoding.
+        // Setting it manually causes URLSession to return raw compressed bytes.
         config.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
             "Accept-Language": "en-US,en;q=0.9",
-            "Accept-Encoding": "gzip, deflate, br, zstd",
             "Connection": "keep-alive",
             "sec-ch-ua": "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not-A.Brand\";v=\"99\"",
             "sec-ch-ua-mobile": "?0",
