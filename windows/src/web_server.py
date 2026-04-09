@@ -252,6 +252,29 @@ def sync_profile(username):
 
 
 # ---------------------------------------------------------------------------
+# Stop / Skip API
+# ---------------------------------------------------------------------------
+
+@app.route("/api/stop", methods=["POST"])
+def stop_all():
+    guard = _require_auth()
+    if guard:
+        return guard
+    _dm().stop_all()
+    return jsonify({"success": True, "message": "Stopping all downloads"})
+
+
+@app.route("/api/skip/<username>", methods=["POST"])
+def skip_profile(username):
+    guard = _require_auth()
+    if guard:
+        return guard
+    username = _clean_username(username)
+    _dm().skip_profile(username)
+    return jsonify({"success": True, "message": f"Skipping @{username}"})
+
+
+# ---------------------------------------------------------------------------
 # Settings API
 # ---------------------------------------------------------------------------
 
@@ -272,6 +295,7 @@ def get_settings():
         "max_concurrent_profiles": s.max_concurrent_profiles,
         "max_concurrent_files":  s.max_concurrent_files,
         "web_server_port":       s.web_server_port,
+        "web_server_password":   s.web_server_password,
     })
 
 
@@ -285,6 +309,7 @@ def update_settings():
         "download_path", "check_interval_hours", "download_posts", "download_reels",
         "download_videos", "download_highlights", "download_stories",
         "max_concurrent_profiles", "max_concurrent_files",
+        "web_server_port", "web_server_password",
     }
     updates = {k: v for k, v in data.items() if k in allowed}
     _settings.update(updates)

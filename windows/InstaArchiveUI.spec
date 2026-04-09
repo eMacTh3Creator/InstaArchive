@@ -1,20 +1,39 @@
-# InstaArchive.spec — PyInstaller build spec (tray-only mode)
-# Build with: pyinstaller InstaArchive.spec
+# InstaArchiveUI.spec — PyInstaller build spec (native desktop UI)
+# Build with: pyinstaller InstaArchiveUI.spec
 #
 # Supports: Windows x64 and Windows ARM64 (Surface Pro X, Copilot+ PCs)
 # For ARM64: run this spec on an ARM64 machine with ARM64 Python installed.
 #
-# This builds the tray-only version (no native UI window).
-# For the native desktop UI version, use InstaArchiveUI.spec instead.
+# This builds the native PyQt6 desktop app. It launches the Flask backend
+# as a subprocess and provides a full GUI window with sidebar, profile list,
+# detail views, settings, and embedded Instagram login.
 
 block_cipher = None
 
 a = Analysis(
-    ['src/main.py'],
+    ['src/ui.py'],
     pathex=['src'],
     binaries=[],
-    datas=[],
+    datas=[
+        ('src/main.py', 'src'),
+        ('src/app_settings.py', 'src'),
+        ('src/profile_store.py', 'src'),
+        ('src/download_manager.py', 'src'),
+        ('src/instagram_service.py', 'src'),
+        ('src/storage_manager.py', 'src'),
+        ('src/thumbnail_cache.py', 'src'),
+        ('src/scheduler.py', 'src'),
+        ('src/web_server.py', 'src'),
+        ('src/tray_app.py', 'src'),
+    ],
     hiddenimports=[
+        # PyQt6
+        'PyQt6.QtCore',
+        'PyQt6.QtGui',
+        'PyQt6.QtWidgets',
+        'PyQt6.QtWebEngineWidgets',
+        'PyQt6.QtWebEngineCore',
+        # Backend dependencies
         'pystray._win32',
         'PIL._tkinter_finder',
         'PIL.Image',
@@ -48,7 +67,6 @@ a = Analysis(
         'smtplib',
         'telnetlib',
         'nntplib',
-        'PyQt6',
     ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,

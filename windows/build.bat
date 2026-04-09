@@ -1,6 +1,10 @@
 @echo off
 REM InstaArchive Windows build script
 REM Requirements: Python 3.11+, pip install -r requirements.txt
+REM
+REM Usage:
+REM   build.bat          — build tray-only version (lightweight, browser UI)
+REM   build.bat ui       — build native desktop UI version (PyQt6 window)
 
 echo ===========================================
 echo  InstaArchive Windows Build
@@ -32,9 +36,15 @@ if not exist "assets\icon.ico" (
     python -c "from PIL import Image, ImageDraw; s=64; img=Image.new('RGBA',(s,s),(0,0,0,0)); d=ImageDraw.Draw(img); d.ellipse([4,4,60,60],fill='#6366f1'); d.rounded_rectangle([16,22,48,46],radius=4,fill='white'); d.ellipse([24,26,40,42],fill='#6366f1'); d.ellipse([27,29,37,39],fill='white'); img.save('assets/icon.ico')"
 )
 
-REM Build with PyInstaller
-echo Building executable...
-pyinstaller InstaArchive.spec --clean --noconfirm
+REM Choose build mode
+if /i "%1"=="ui" (
+    echo Building native desktop UI version...
+    pyinstaller InstaArchiveUI.spec --clean --noconfirm
+) else (
+    echo Building tray-only version...
+    pyinstaller InstaArchive.spec --clean --noconfirm
+)
+
 if errorlevel 1 (
     echo ERROR: Build failed
     pause

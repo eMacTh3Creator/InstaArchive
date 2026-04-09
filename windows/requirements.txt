@@ -4,3 +4,5 @@ pillow>=10.0.0
 pystray>=0.19.5
 APScheduler>=3.10.0
 pyinstaller>=6.0.0
+PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0

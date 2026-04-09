@@ -69,12 +69,15 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "Chrome/136.0.0.0 Safari/537.36"
     ),
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate, br, zstd",
     "Connection":      "keep-alive",
     "X-IG-App-ID":     APP_ID,
+    "sec-ch-ua":          '"Chromium";v="136", "Google Chrome";v="136", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile":   "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 
@@ -148,12 +151,13 @@ class InstagramService:
     def reset_session(self):
         self._session_ready = False
         self._csrf_token = None
+        # Preserve sessionid so the user doesn't have to log in again
+        saved_session_id = self._session.cookies.get("sessionid", domain=".instagram.com")
         self._session.cookies.clear()
+        if saved_session_id:
+            self._session.cookies.set("sessionid", saved_session_id, domain=".instagram.com")
         self._settings.is_logged_in = False
-        path = self._settings.cookies_path
-        if path.exists():
-            path.unlink()
-        print("[Instagram] Session reset")
+        print("[Instagram] Session reset (sessionid preserved)")
 
     # ------------------------------------------------------------------
     # Rate limiting
@@ -161,16 +165,39 @@ class InstagramService:
 
     def _wait_rate_limit(self):
         with self._rate_lock:
+            jitter = random.uniform(0.3, 1.8)
+            effective_interval = self._min_interval + jitter
             elapsed = time.monotonic() - self._last_request_time
-            if elapsed < self._min_interval:
-                time.sleep(self._min_interval - elapsed + random.uniform(0, 0.3))
+            if elapsed < effective_interval:
+                time.sleep(effective_interval - elapsed)
             self._last_request_time = time.monotonic()
 
-    def _get(self, url: str, params: dict = None, referer: str = None) -> requests.Response:
+    def _get(self, url: str, params: dict = None, referer: str = None, is_api: bool = False) -> requests.Response:
         self._wait_rate_limit()
-        headers = {}
+        headers: dict[str, str] = {}
         if referer:
             headers["Referer"] = referer
+            headers["Origin"] = "https://www.instagram.com"
+        if is_api:
+            headers["Accept"] = "application/json, text/javascript, */*; q=0.01"
+            headers["X-Requested-With"] = "XMLHttpRequest"
+            headers["Sec-Fetch-Site"] = "same-origin"
+            headers["Sec-Fetch-Mode"] = "cors"
+            headers["Sec-Fetch-Dest"] = "empty"
+            headers["dpr"] = "1"
+            if self._csrf_token:
+                headers["X-CSRFToken"] = self._csrf_token
+        else:
+            headers["Accept"] = (
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                "application/signed-exchange;v=b3;q=0.7"
+            )
+            headers["Sec-Fetch-Dest"] = "document"
+            headers["Sec-Fetch-Mode"] = "navigate"
+            headers["Sec-Fetch-Site"] = "none"
+            headers["Sec-Fetch-User"] = "?1"
+            headers["Upgrade-Insecure-Requests"] = "1"
         resp = self._session.get(url, params=params, headers=headers, timeout=30)
         return resp
 
@@ -180,7 +207,7 @@ class InstagramService:
 
     def fetch_profile_info(self, username: str) -> ProfileInfo:
         url = f"{BASE_URL}/api/v1/users/web_profile_info/"
-        resp = self._get(url, params={"username": username}, referer=f"{BASE_URL}/{username}/")
+        resp = self._get(url, params={"username": username}, referer=f"{BASE_URL}/{username}/", is_api=True)
         if resp.status_code == 429:
             raise RateLimitedError("Rate limited")
         if resp.status_code in (401, 403):
@@ -276,7 +303,7 @@ class InstagramService:
         if cursor:
             params["max_id"] = cursor
         try:
-            resp = self._get(url, params=params, referer=BASE_URL + "/")
+            resp = self._get(url, params=params, referer=BASE_URL + "/", is_api=True)
             if resp.status_code != 200:
                 return [], None
             data = resp.json()
@@ -297,6 +324,7 @@ class InstagramService:
                 f"{BASE_URL}/graphql/query/",
                 params={"doc_id": doc_id, "variables": json.dumps(variables)},
                 referer=f"{BASE_URL}/{username}/",
+                is_api=True,
             )
             if resp.status_code != 200:
                 return [], None
@@ -425,7 +453,7 @@ class InstagramService:
     def fetch_stories(self, user_id: str, username: str) -> list[DiscoveredMedia]:
         url = f"{BASE_URL}/api/v1/feed/user/{user_id}/story/"
         try:
-            resp = self._get(url, referer=f"{BASE_URL}/{username}/")
+            resp = self._get(url, referer=f"{BASE_URL}/{username}/", is_api=True)
             if resp.status_code != 200:
                 return []
             data = resp.json()
@@ -479,7 +507,7 @@ class InstagramService:
     def _fetch_highlight_reel_ids(self, user_id: str, username: str) -> list[str]:
         url = f"{BASE_URL}/api/v1/highlights/{user_id}/highlights_tray/"
         try:
-            resp = self._get(url, referer=f"{BASE_URL}/{username}/")
+            resp = self._get(url, referer=f"{BASE_URL}/{username}/", is_api=True)
             if resp.status_code != 200:
                 return []
             data = resp.json()
@@ -493,7 +521,7 @@ class InstagramService:
         full_id = reel_id if reel_id.startswith("highlight:") else f"highlight:{reel_id}"
         url = f"{BASE_URL}/api/v1/feed/reels_media/"
         try:
-            resp = self._get(url, params={"reel_ids": full_id}, referer=f"{BASE_URL}/{username}/")
+            resp = self._get(url, params={"reel_ids": full_id}, referer=f"{BASE_URL}/{username}/", is_api=True)
             if resp.status_code != 200:
                 return []
             data = resp.json()
