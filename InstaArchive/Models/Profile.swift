@@ -46,10 +46,13 @@ struct Profile: Identifiable, Codable, Hashable {
         customCheckIntervalHours ?? AppSettings.shared.checkIntervalHours
     }
 
-    /// Whether this profile is due for a check based on its schedule
+    /// Whether this profile is due for a scheduled check.
+    /// Profiles that have never been checked return false — they must be
+    /// explicitly synced first (via "Add & Sync" or manual "Check Now").
+    /// This prevents the scheduler from auto-syncing 180 newly-added profiles.
     func isDue() -> Bool {
         guard isActive else { return false }
-        guard let lastChecked = lastChecked else { return true }  // never checked = due now
+        guard let lastChecked = lastChecked else { return false }
         let intervalSeconds = TimeInterval(effectiveCheckIntervalHours() * 3600)
         return Date().timeIntervalSince(lastChecked) >= intervalSeconds
     }

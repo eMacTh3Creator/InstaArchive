@@ -1,11 +1,15 @@
 import Foundation
 import Combine
 
-/// Observable store managing the list of tracked profiles
+/// Observable store managing the list of tracked profiles.
+/// Uses manual objectWillChange with debouncing to avoid flooding
+/// SwiftUI with re-renders when profiles are added rapidly.
 class ProfileStore: ObservableObject {
-    @Published var profiles: [Profile] = []
+    // NOT @Published — we manage objectWillChange manually with debouncing
+    var profiles: [Profile] = []
 
     private let storage = StorageManager.shared
+    private var _debounceTimer: Timer?
 
     init() {
         profiles = storage.loadProfiles()
@@ -15,29 +19,47 @@ class ProfileStore: ObservableObject {
     func addProfile(_ profile: Profile) {
         guard !profiles.contains(where: { $0.username == profile.username }) else { return }
         profiles.append(profile)
-        storage.createProfileDirectories(for: profile.username)
-        saveAll()
+        // Create dirs on background — don't block main thread
+        let username = profile.username
+        DispatchQueue.global(qos: .utility).async {
+            StorageManager.shared.createProfileDirectories(for: username)
+        }
+        debouncedNotify()
+        saveAllAsync()
     }
 
     /// Remove a profile from the store (keeps downloaded files)
     func removeProfile(_ profile: Profile) {
         profiles.removeAll { $0.id == profile.id }
-        saveAll()
+        debouncedNotify()
+        saveAllAsync()
     }
 
     /// Remove a profile and delete all its downloaded files and index entries
     func removeProfileAndFiles(_ profile: Profile) {
         profiles.removeAll { $0.id == profile.id }
-        saveAll()
-        // Remove index entries
-        DownloadManager.shared.removeMediaIndex(for: profile.username)
-        // Delete files from disk
-        StorageManager.shared.deleteProfileFiles(for: profile.username)
+        debouncedNotify()
+        saveAllAsync()
+        // Remove index entries and files on background
+        let username = profile.username
+        DispatchQueue.global(qos: .utility).async {
+            DownloadManager.shared.removeMediaIndex(for: username)
+            StorageManager.shared.deleteProfileFiles(for: username)
+        }
     }
 
-    /// Persist all profiles to disk
+    /// Persist all profiles to disk (synchronous — for callers that need it immediately)
     func saveAll() {
         storage.saveProfiles(profiles)
+        debouncedNotify()
+    }
+
+    /// Persist all profiles to disk on a background queue
+    private func saveAllAsync() {
+        let snapshot = profiles
+        DispatchQueue.global(qos: .utility).async {
+            StorageManager.shared.saveProfiles(snapshot)
+        }
     }
 
     /// Update a specific profile
@@ -45,6 +67,17 @@ class ProfileStore: ObservableObject {
         if let index = profiles.firstIndex(where: { $0.id == profile.id }) {
             profiles[index] = profile
             saveAll()
+        }
+    }
+
+    // MARK: - Debounced UI Notification
+
+    /// Coalesce rapid changes into a single objectWillChange after 200ms of quiet.
+    /// This prevents N rapid adds from triggering N full sidebar re-renders.
+    private func debouncedNotify() {
+        _debounceTimer?.invalidate()
+        _debounceTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { [weak self] _ in
+            self?.objectWillChange.send()
         }
     }
 
@@ -71,7 +104,6 @@ class ProfileStore: ObservableObject {
         for var profile in imported {
             let username = profile.username.lowercased()
             guard !profiles.contains(where: { $0.username == username }) else { continue }
-            // Give imported profiles fresh UUIDs to avoid collisions
             profile = Profile(
                 username: profile.username,
                 displayName: profile.displayName,
@@ -80,11 +112,20 @@ class ProfileStore: ObservableObject {
                 isActive: profile.isActive
             )
             profiles.append(profile)
-            storage.createProfileDirectories(for: profile.username)
             added += 1
         }
 
-        if added > 0 { saveAll() }
+        if added > 0 {
+            // Create dirs on background
+            let usernames = imported.map { $0.username }
+            DispatchQueue.global(qos: .utility).async {
+                for u in usernames {
+                    StorageManager.shared.createProfileDirectories(for: u)
+                }
+            }
+            debouncedNotify()
+            saveAllAsync()
+        }
         return added
     }
 }

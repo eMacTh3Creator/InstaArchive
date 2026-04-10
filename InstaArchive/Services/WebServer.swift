@@ -702,9 +702,10 @@ class WebServer: ObservableObject {
           <div class="stat"><span class="stat-val" id="statStatus">-</span><span class="stat-label">Status</span></div>
         </div>
 
-        <form class="add-form" onsubmit="addProfile(event)">
+        <form class="add-form" onsubmit="addProfile(event, true)">
           <input type="text" id="usernameInput" placeholder="Username, @handle, or Instagram URL" autocomplete="off" spellcheck="false" />
-          <button type="submit" class="btn btn-primary" id="addBtn">Add</button>
+          <button type="button" class="btn btn-outline" id="addBtn" onclick="addProfile(null, false)">Add</button>
+          <button type="submit" class="btn btn-primary" id="addSyncBtn">Add &amp; Sync</button>
         </form>
 
         <div class="section-head">
@@ -810,12 +811,13 @@ class WebServer: ObservableObject {
 
     function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
 
-    async function addProfile(e) {
-      e.preventDefault();
+    async function addProfile(e, startSync) {
+      if (e) e.preventDefault();
       const input = document.getElementById('usernameInput');
       const username = input.value.trim();
       if (!username) return;
       document.getElementById('addBtn').disabled = true;
+      document.getElementById('addSyncBtn').disabled = true;
       try {
         const res = await fetch('/api/profiles', {
           method: 'POST',
@@ -824,10 +826,18 @@ class WebServer: ObservableObject {
         });
         const data = await res.json();
         if (data.error) { showToast(data.error, 'error'); }
-        else { showToast(data.message, 'success'); input.value = ''; }
+        else {
+          showToast(data.message, 'success');
+          input.value = '';
+          if (startSync) {
+            await fetch('/api/sync/' + encodeURIComponent(username), { method: 'POST' });
+            showToast('Sync started for @' + username, 'success');
+          }
+        }
         loadProfiles(); loadStatus();
       } catch (err) { showToast('Failed to add profile', 'error'); }
       document.getElementById('addBtn').disabled = false;
+      document.getElementById('addSyncBtn').disabled = false;
     }
 
     async function removeProfile(username) {
