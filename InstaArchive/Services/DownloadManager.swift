@@ -44,21 +44,18 @@ class DownloadManager: ObservableObject {
     static let shared = DownloadManager()
 
     // ---------------------------------------------------------------
-    // UI-visible state — NOT @Published. We manage objectWillChange
-    // manually with throttling so rapid progress updates don't freeze
-    // the UI by triggering constant SwiftUI re-renders.
+    // UI-visible state — NOT @Published. objectWillChange is ONLY
+    // sent for state transitions (start/stop/complete/error), NEVER
+    // for progress ticks. This prevents 180-row sidebar re-renders
+    // every few hundred milliseconds during downloads.
+    //
+    // The bottom bar polls `currentActivity` on its own timer.
     // ---------------------------------------------------------------
     var profileStatuses: [String: DownloadStatus] = [:]
     var isRunning = false
     var currentActivity: String = ""
     var totalNewItems: Int = 0
     var activeUsernames: Set<String> = []
-
-    // Throttle: publish at most every 300ms for transient states,
-    // but always publish immediately for final states.
-    private var _uiDirty = false
-    private var _publishTimer: Timer?
-    private let _publishInterval: TimeInterval = 0.5
 
     private let instagram = InstagramService.shared
     private let storage = StorageManager.shared
@@ -83,34 +80,21 @@ class DownloadManager: ObservableObject {
         rebuildIdIndex()
     }
 
-    // MARK: - Throttled UI Publishing
+    // MARK: - UI Publishing
+    //
+    // Only call publishTransition() for real state changes that the
+    // sidebar rows or detail view need to react to:
+    //   - isRunning changed
+    //   - profileStatuses[x] transitioned between cases (idle→checking, etc.)
+    //   - activeUsernames changed
+    //
+    // Do NOT publish for:
+    //   - currentActivity text updates (bottom bar polls these)
+    //   - download progress within .downloading state
 
     @MainActor
-    private func notifyUI(immediate: Bool = false) {
-        if immediate {
-            _uiDirty = false
-            objectWillChange.send()
-            return
-        }
-        _uiDirty = true
-        if _publishTimer == nil {
-            _publishTimer = Timer.scheduledTimer(withTimeInterval: _publishInterval, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
-                Task { @MainActor in self._flushUI() }
-            }
-            RunLoop.main.add(_publishTimer!, forMode: .common)
-        }
-    }
-
-    @MainActor
-    private func _flushUI() {
-        if _uiDirty {
-            _uiDirty = false
-            objectWillChange.send()
-        } else {
-            _publishTimer?.invalidate()
-            _publishTimer = nil
-        }
+    private func publishTransition() {
+        objectWillChange.send()
     }
 
     // MARK: - Index Management
@@ -165,7 +149,7 @@ class DownloadManager: ObservableObject {
                 self.isRunning = false
                 self.currentActivity = ""
             }
-            self.notifyUI(immediate: true)
+            self.publishTransition()
         }
     }
 
@@ -187,7 +171,7 @@ class DownloadManager: ObservableObject {
             self.activeUsernames.removeAll()
             self.isRunning = false
             self.currentActivity = ""
-            self.notifyUI(immediate: true)
+            self.publishTransition()
         }
     }
 
@@ -269,7 +253,7 @@ class DownloadManager: ObservableObject {
             await MainActor.run {
                 self.isRunning = false
                 self.currentActivity = ""
-                self.notifyUI(immediate: true)
+                self.publishTransition()
             }
         }
     }
@@ -282,7 +266,7 @@ class DownloadManager: ObservableObject {
             self.activeUsernames.insert(username)
             self.profileStatuses[username] = .checking
             self.currentActivity = "Checking @\(username)..."
-            self.notifyUI(immediate: true)
+            self.publishTransition()
         }
 
         log.info("Starting check for @\(username)", context: "check")
@@ -316,7 +300,7 @@ class DownloadManager: ObservableObject {
             try Task.checkCancellation()
             await MainActor.run {
                 self.currentActivity = "Fetching posts for @\(username)..."
-                self.notifyUI()
+                // Bottom bar polls currentActivity — no objectWillChange needed
             }
             log.info("Fetching posts for @\(username)", context: "check")
             do {
@@ -336,7 +320,7 @@ class DownloadManager: ObservableObject {
             if settings.downloadStories, !profileInfo.userId.isEmpty {
                 await MainActor.run {
                     self.currentActivity = "Fetching stories for @\(username)..."
-                    self.notifyUI()
+                    // Bottom bar polls currentActivity — no objectWillChange needed
                 }
                 do {
                     let stories = try await instagram.fetchStories(
@@ -355,7 +339,7 @@ class DownloadManager: ObservableObject {
             if settings.downloadHighlights, !profileInfo.userId.isEmpty {
                 await MainActor.run {
                     self.currentActivity = "Fetching highlights for @\(username)..."
-                    self.notifyUI()
+                    // Bottom bar polls currentActivity — no objectWillChange needed
                 }
                 do {
                     let highlights = try await instagram.fetchHighlights(
@@ -489,7 +473,7 @@ class DownloadManager: ObservableObject {
                             await MainActor.run {
                                 self.profileStatuses[username] = .downloading(progress: progress)
                                 self.currentActivity = "Downloading @\(username) (\(completed)/\(totalToDownload))..."
-                                self.notifyUI()
+                                // Bottom bar polls currentActivity — no objectWillChange needed
                             }
                         }
                     }
@@ -522,7 +506,7 @@ class DownloadManager: ObservableObject {
                 }
                 self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
                 self.totalNewItems += finalNewItemCount
-                self.notifyUI(immediate: true)
+                self.publishTransition()
             }
 
         } catch is CancellationError {
@@ -532,7 +516,7 @@ class DownloadManager: ObservableObject {
                 if self.profileStatuses[username] != .skipped {
                     self.profileStatuses[username] = .skipped
                 }
-                self.notifyUI(immediate: true)
+                self.publishTransition()
             }
         } catch let error as InstagramError {
             saveIndexAsync()
@@ -543,7 +527,7 @@ class DownloadManager: ObservableObject {
             }
             await MainActor.run {
                 self.profileStatuses[username] = .error(error.localizedDescription)
-                self.notifyUI(immediate: true)
+                self.publishTransition()
             }
         } catch {
             saveIndexAsync()
@@ -551,7 +535,7 @@ class DownloadManager: ObservableObject {
             log.error("Unexpected error for @\(username): \(msg)", context: "check")
             await MainActor.run {
                 self.profileStatuses[username] = .error(msg)
-                self.notifyUI(immediate: true)
+                self.publishTransition()
             }
         }
 
@@ -562,7 +546,7 @@ class DownloadManager: ObservableObject {
                 self.isRunning = false
                 self.currentActivity = ""
             }
-            self.notifyUI(immediate: true)
+            self.publishTransition()
         }
     }
 
@@ -589,7 +573,7 @@ class DownloadManager: ObservableObject {
 
                 await MainActor.run {
                     self.currentActivity = "Queue: \(index + 1)/\(activeProfiles.count) — @\(profile.username)"
-                    self.notifyUI()
+                    // Bottom bar polls currentActivity — no objectWillChange needed
                 }
 
                 await self.performCheck(profile, profileStore: profileStore)
@@ -607,7 +591,7 @@ class DownloadManager: ObservableObject {
                         self.log.info("Batch cooldown: pausing \(Int(cooldown))s after \(batchSize) profiles", context: "rate")
                         await MainActor.run {
                             self.currentActivity = "Cooldown before next batch (\(Int(cooldown))s)..."
-                            self.notifyUI()
+                            // Bottom bar polls currentActivity — no objectWillChange needed
                         }
                     } else {
                         cooldown = Double.random(in: 20...60)
@@ -619,7 +603,7 @@ class DownloadManager: ObservableObject {
             await MainActor.run {
                 self.isRunning = false
                 self.currentActivity = ""
-                self.notifyUI(immediate: true)
+                self.publishTransition()
             }
         }
     }
@@ -651,9 +635,10 @@ class DownloadManager: ObservableObject {
         return downloadedMedia.count
     }
 
+    @MainActor
     func clearStatus(for username: String) {
         profileStatuses[username] = .idle
-        objectWillChange.send()
+        publishTransition()
     }
 
     func reloadIndex() {

@@ -231,49 +231,11 @@ struct SidebarView: View {
 
             Divider()
 
-            // Bottom bar
-            HStack {
-                if downloadManager.isRunning {
-                    ProgressView()
-                        .controlSize(.small)
-                        .scaleEffect(0.7)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(downloadManager.currentActivity)
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        if downloadManager.activeUsernames.count > 1 {
-                            Text("\(downloadManager.activeUsernames.count) profiles active")
-                                .font(.system(size: 9))
-                                .foregroundColor(.secondary.opacity(0.7))
-                        }
-                    }
-                } else {
-                    Text("\(profiles.count) profile\(profiles.count == 1 ? "" : "s")")
-                        .font(.system(size: 11))
-                        .foregroundColor(.secondary)
-                }
-                Spacer()
-                if downloadManager.isRunning {
-                    Button(action: { downloadManager.stopAll() }) {
-                        Image(systemName: "stop.fill")
-                            .font(.system(size: 10))
-                            .foregroundColor(.red)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Stop All Downloads")
-                }
-                Button(action: onCheckAll) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.system(size: 11))
-                }
-                .buttonStyle(.plain)
-                .disabled(downloadManager.isRunning)
-                .help("Check All Profiles")
-            }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 8)
+            // Bottom bar — separate view with its own polling timer
+            SidebarBottomBar(
+                profileCount: profiles.count,
+                onCheckAll: onCheckAll
+            )
         }
     }
 
@@ -435,6 +397,85 @@ struct ProfileRowView: View {
                 )
         )
         .padding(.horizontal, 6)
+    }
+}
+
+/// Bottom bar that polls DownloadManager.currentActivity on its own timer.
+/// This avoids triggering objectWillChange → full sidebar re-render for activity text updates.
+struct SidebarBottomBar: View {
+    let profileCount: Int
+    let onCheckAll: () -> Void
+
+    @EnvironmentObject var downloadManager: DownloadManager
+    @State private var activityText: String = ""
+    @State private var pollTimer: Timer?
+
+    var body: some View {
+        HStack {
+            if downloadManager.isRunning {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(activityText)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if downloadManager.activeUsernames.count > 1 {
+                        Text("\(downloadManager.activeUsernames.count) profiles active")
+                            .font(.system(size: 9))
+                            .foregroundColor(.secondary.opacity(0.7))
+                    }
+                }
+            } else {
+                Text("\(profileCount) profile\(profileCount == 1 ? "" : "s")")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            Spacer()
+            if downloadManager.isRunning {
+                Button(action: { downloadManager.stopAll() }) {
+                    Image(systemName: "stop.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.red)
+                }
+                .buttonStyle(.plain)
+                .help("Stop All Downloads")
+            }
+            Button(action: onCheckAll) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .disabled(downloadManager.isRunning)
+            .help("Check All Profiles")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .onAppear { startPolling() }
+        .onDisappear { stopPolling() }
+        .onChange(of: downloadManager.isRunning) { running in
+            if running { startPolling() } else { stopPolling(); activityText = "" }
+        }
+    }
+
+    private func startPolling() {
+        stopPolling()
+        activityText = downloadManager.currentActivity
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            Task { @MainActor in
+                activityText = downloadManager.currentActivity
+            }
+        }
+        if let timer = pollTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
     }
 }
 
