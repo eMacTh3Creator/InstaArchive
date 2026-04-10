@@ -62,6 +62,15 @@ class InstagramService {
     private let baseURL = "https://www.instagram.com"
     private let igAppId = "936619743392459"
 
+    /// Pick the highest-resolution image candidate from image_versions2.candidates.
+    /// Instagram returns candidates in arbitrary order — sorting by width descending
+    /// ensures we always get the full-res image, not a thumbnail.
+    private func bestImageURL(from candidates: [[String: Any]]) -> String? {
+        return candidates
+            .sorted { ($0["width"] as? Int ?? 0) > ($1["width"] as? Int ?? 0) }
+            .first?["url"] as? String
+    }
+
     // Rate limiting — thread-safe with lock
     private var lastRequestTime: Date?
     private let rateLock = NSLock()
@@ -917,7 +926,7 @@ class InstagramService {
             } else if let displayURL = item["display_url"] as? String {
                 mediaURLs.append(displayURL)
             } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                      let url = candidates.first?["url"] as? String {
+                      let url = bestImageURL(from: candidates) {
                 mediaURLs.append(url)
             }
 
@@ -961,14 +970,14 @@ class InstagramService {
                let videoURL = bestVideo["url"] as? String {
                 mediaURLs.append(videoURL)
             } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                      let bestImage = candidates.first,
-                      let imageURL = bestImage["url"] as? String {
+                      let imageURL = bestImageURL(from: candidates) {
                 mediaURLs.append(imageURL)
             }
 
             guard !mediaURLs.isEmpty else { continue }
 
-            let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])?.first?["url"] as? String
+            let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
+                .flatMap(bestImageURL(from:))
 
             media.append(DiscoveredMedia(
                 instagramId: "story_\(storyId)",
@@ -1176,8 +1185,7 @@ class InstagramService {
                let videoURL = bestVideo["url"] as? String {
                 mediaURLs.append(videoURL)
             } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                      let bestImage = candidates.first,
-                      let imageURL = bestImage["url"] as? String {
+                      let imageURL = bestImageURL(from: candidates) {
                 mediaURLs.append(imageURL)
             }
 
@@ -1192,7 +1200,8 @@ class InstagramService {
 
             guard !mediaURLs.isEmpty else { continue }
 
-            let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])?.first?["url"] as? String
+            let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
+                .flatMap(bestImageURL(from:))
                 ?? item["display_url"] as? String
 
             media.append(DiscoveredMedia(
@@ -1270,12 +1279,13 @@ class InstagramService {
                        let videoURL = bestVideo["url"] as? String {
                         mediaURLs.append(videoURL)
                     } else if let candidates = (carouselItem["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                              let bestImage = candidates.first,
-                              let imageURL = bestImage["url"] as? String {
+                              let imageURL = bestImageURL(from: candidates) {
                         mediaURLs.append(imageURL)
                     }
                 }
-                thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])?.first?["url"] as? String
+                if let thumbCandidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]] {
+                    thumbnailURL = bestImageURL(from: thumbCandidates)
+                }
             } else if isVideo {
                 if let videoVersions = item["video_versions"] as? [[String: Any]],
                    let bestVideo = videoVersions.first,
@@ -1284,11 +1294,12 @@ class InstagramService {
                 }
                 let productType = item["product_type"] as? String ?? ""
                 itemMediaType = productType == "clips" ? .reel : .video
-                thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])?.first?["url"] as? String
+                if let thumbCandidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]] {
+                    thumbnailURL = bestImageURL(from: thumbCandidates)
+                }
             } else {
                 if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                   let bestImage = candidates.first,
-                   let imageURL = bestImage["url"] as? String {
+                   let imageURL = bestImageURL(from: candidates) {
                     mediaURLs.append(imageURL)
                     thumbnailURL = imageURL
                 }
@@ -1441,7 +1452,7 @@ class InstagramService {
                    let url = videoVersions.first?["url"] as? String {
                     mediaURLs.append(url)
                 } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                          let url = candidates.first?["url"] as? String {
+                          let url = bestImageURL(from: candidates) {
                     mediaURLs.append(url)
                 }
             }
@@ -1450,7 +1461,7 @@ class InstagramService {
         } else if let displayURL = node["display_url"] as? String {
             mediaURLs.append(displayURL)
         } else if let candidates = (node["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                  let url = candidates.first?["url"] as? String {
+                  let url = bestImageURL(from: candidates) {
             mediaURLs.append(url)
         }
 
@@ -1462,7 +1473,8 @@ class InstagramService {
 
         let thumbnailURL = node["thumbnail_src"] as? String
             ?? node["display_url"] as? String
-            ?? ((node["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])?.first?["url"] as? String
+            ?? ((node["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
+                .flatMap(bestImageURL(from:))
 
         return DiscoveredMedia(
             instagramId: shortcode,
@@ -1673,8 +1685,7 @@ class InstagramService {
                            let videoURL = bestVideo["url"] as? String {
                             mediaURLs.append(videoURL)
                         } else if let candidates = (carouselItem["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                                  let bestImage = candidates.first,
-                                  let imageURL = bestImage["url"] as? String {
+                                  let imageURL = bestImageURL(from: candidates) {
                             mediaURLs.append(imageURL)
                         }
                     }
@@ -1688,14 +1699,14 @@ class InstagramService {
                     itemMediaType = productType == "clips" ? .reel : .video
                 } else {
                     if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                       let bestImage = candidates.first,
-                       let imageURL = bestImage["url"] as? String {
+                       let imageURL = bestImageURL(from: candidates) {
                         mediaURLs.append(imageURL)
                     }
                 }
 
                 if !mediaURLs.isEmpty {
-                    let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])?.first?["url"] as? String
+                    let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
+                        .flatMap(bestImageURL(from:))
                     return DiscoveredMedia(
                         instagramId: code,
                         mediaType: itemMediaType,

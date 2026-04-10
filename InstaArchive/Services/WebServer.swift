@@ -241,6 +241,9 @@ class WebServer: ObservableObject {
             handleGetStatus(connection: connection)
         case ("POST", "/api/sync/all"):
             handleSyncAll(connection: connection)
+        case ("POST", _) where path.hasPrefix("/api/refresh/"):
+            let username = String(path.dropFirst("/api/refresh/".count))
+            handleRefreshProfile(username: username, connection: connection)
         case ("POST", _) where path.hasPrefix("/api/sync/"):
             let username = String(path.dropFirst("/api/sync/".count))
             handleSyncProfile(username: username, connection: connection)
@@ -288,68 +291,16 @@ class WebServer: ObservableObject {
     // MARK: - API Handlers
 
     private func handleGetProfiles(connection: NWConnection) {
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self, let profiles = self.profileStore?.profiles else {
-                self?.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
-                return
-            }
-
-            let dm = DownloadManager.shared
-            let data: [[String: Any]] = profiles.map { p in
-                var status = "idle"
-                if let s = dm.profileStatuses[p.username] {
-                    switch s {
-                    case .checking: status = "checking"
-                    case .downloading(let prog): status = "downloading:\(Int(prog * 100))"
-                    case .completed(let n): status = "completed:\(n)"
-                    case .skipped: status = "skipped"
-                    case .error(let e): status = "error:\(e)"
-                    case .idle: status = "idle"
-                    }
-                }
-                return [
-                    "username": p.username,
-                    "displayName": p.displayName,
-                    "isActive": p.isActive,
-                    "totalDownloaded": p.totalDownloaded,
-                    "dateAdded": ISO8601DateFormatter().string(from: p.dateAdded),
-                    "lastChecked": p.lastChecked.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
-                    "status": status
-                ]
-            }
-
-            self.sendJSON(connection: connection, json: data)
+        guard let profiles = self.profileStore?.profiles else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
         }
-    }
 
-    private func handleGetProfileDetail(username: String, connection: NWConnection) {
-        let clean = (username.removingPercentEncoding ?? username).lowercased()
-
-        DispatchQueue.main.async { [weak self] in
-            guard let store = self?.profileStore else {
-                self?.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
-                return
-            }
-
-            guard let profile = store.profiles.first(where: { $0.username == clean }) else {
-                self?.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
-                return
-            }
-
-            let dm = DownloadManager.shared
-            let items = dm.mediaItems(for: clean)
-
-            // Count by media type
-            var typeCounts: [String: Int] = [:]
-            var totalSize: Int64 = 0
-            for item in items {
-                typeCounts[item.mediaType.rawValue, default: 0] += 1
-                totalSize += item.fileSize ?? 0
-            }
-
-            // Download status
+        let dm = DownloadManager.shared
+        let statuses = dm.profileStatuses
+        let data: [[String: Any]] = profiles.map { p in
             var status = "idle"
-            if let s = dm.profileStatuses[clean] {
+            if let s = statuses[p.username] {
                 switch s {
                 case .checking: status = "checking"
                 case .downloading(let prog): status = "downloading:\(Int(prog * 100))"
@@ -359,24 +310,74 @@ class WebServer: ObservableObject {
                 case .idle: status = "idle"
                 }
             }
-
-            let json: [String: Any] = [
-                "username": profile.username,
-                "displayName": profile.displayName,
-                "bio": profile.bio ?? "",
-                "isActive": profile.isActive,
-                "totalDownloaded": profile.totalDownloaded,
-                "dateAdded": ISO8601DateFormatter().string(from: profile.dateAdded),
-                "lastChecked": profile.lastChecked.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
-                "lastNewContent": profile.lastNewContent.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
-                "mediaByType": typeCounts,
-                "totalFileSize": totalSize,
-                "totalIndexed": items.count,
+            return [
+                "username": p.username,
+                "displayName": p.displayName,
+                "isActive": p.isActive,
+                "totalDownloaded": p.totalDownloaded,
+                "dateAdded": ISO8601DateFormatter().string(from: p.dateAdded),
+                "lastChecked": p.lastChecked.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
                 "status": status
             ]
-
-            self?.sendJSON(connection: connection, json: json)
         }
+
+        self.sendJSON(connection: connection, json: data)
+    }
+
+    private func handleGetProfileDetail(username: String, connection: NWConnection) {
+        let clean = (username.removingPercentEncoding ?? username).lowercased()
+
+        guard let store = self.profileStore else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
+        }
+
+        guard let profile = store.profiles.first(where: { $0.username == clean }) else {
+            self.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
+            return
+        }
+
+        let dm = DownloadManager.shared
+        let items = dm.mediaItems(for: clean)
+
+        // Count by media type
+        var typeCounts: [String: Int] = [:]
+        var totalSize: Int64 = 0
+        for item in items {
+            typeCounts[item.mediaType.rawValue, default: 0] += 1
+            totalSize += item.fileSize ?? 0
+        }
+
+        // Download status
+        var status = "idle"
+        let statuses = dm.profileStatuses
+        if let s = statuses[clean] {
+            switch s {
+            case .checking: status = "checking"
+            case .downloading(let prog): status = "downloading:\(Int(prog * 100))"
+            case .completed(let n): status = "completed:\(n)"
+            case .skipped: status = "skipped"
+            case .error(let e): status = "error:\(e)"
+            case .idle: status = "idle"
+            }
+        }
+
+        let json: [String: Any] = [
+            "username": profile.username,
+            "displayName": profile.displayName,
+            "bio": profile.bio ?? "",
+            "isActive": profile.isActive,
+            "totalDownloaded": profile.totalDownloaded,
+            "dateAdded": ISO8601DateFormatter().string(from: profile.dateAdded),
+            "lastChecked": profile.lastChecked.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
+            "lastNewContent": profile.lastNewContent.map { ISO8601DateFormatter().string(from: $0) } ?? NSNull(),
+            "mediaByType": typeCounts,
+            "totalFileSize": totalSize,
+            "totalIndexed": items.count,
+            "status": status
+        ]
+
+        self.sendJSON(connection: connection, json: json)
     }
 
     private func handleAddProfile(body: String?, connection: NWConnection) {
@@ -409,106 +410,113 @@ class WebServer: ObservableObject {
             return
         }
 
-        DispatchQueue.main.async { [weak self] in
-            guard let store = self?.profileStore else {
-                self?.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
-                return
-            }
-
-            if store.profiles.contains(where: { $0.username == username.lowercased() }) {
-                self?.sendJSON(connection: connection, status: "409 Conflict", json: [
-                    "error": "Profile @\(username) is already in your list"
-                ])
-                return
-            }
-
-            let profile = Profile(username: username)
-            store.addProfile(profile)
-
-            self?.sendJSON(connection: connection, json: [
-                "success": true,
-                "message": "Added @\(username) to your archive",
-                "username": username
-            ])
+        guard let store = self.profileStore else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
         }
+
+        if store.profiles.contains(where: { $0.username == username.lowercased() }) {
+            self.sendJSON(connection: connection, status: "409 Conflict", json: [
+                "error": "Profile @\(username) is already in your list"
+            ])
+            return
+        }
+
+        let profile = Profile(username: username)
+        DispatchQueue.main.async { store.addProfile(profile) }
+
+        self.sendJSON(connection: connection, json: [
+            "success": true,
+            "message": "Added @\(username) to your archive",
+            "username": username
+        ])
     }
 
     private func handleDeleteProfile(username: String, connection: NWConnection) {
         let clean = (username.removingPercentEncoding ?? username).lowercased()
 
-        DispatchQueue.main.async { [weak self] in
-            guard let store = self?.profileStore else {
-                self?.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
-                return
-            }
-
-            guard let profile = store.profiles.first(where: { $0.username == clean }) else {
-                self?.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
-                return
-            }
-
-            store.removeProfile(profile)
-            self?.sendJSON(connection: connection, json: ["success": true, "message": "Removed @\(clean)"])
+        guard let store = self.profileStore else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
         }
+
+        guard let profile = store.profiles.first(where: { $0.username == clean }) else {
+            self.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
+            return
+        }
+
+        DispatchQueue.main.async { store.removeProfile(profile) }
+        self.sendJSON(connection: connection, json: ["success": true, "message": "Removed @\(clean)"])
     }
 
     private func handleGetStatus(connection: NWConnection) {
-        DispatchQueue.main.async { [weak self] in
-            let dm = DownloadManager.shared
-            let profiles = self?.profileStore?.profiles ?? []
+        let dm = DownloadManager.shared
+        let profiles = self.profileStore?.profiles ?? []
 
-            let json: [String: Any] = [
-                "isDownloading": dm.isRunning,
-                "totalProfiles": profiles.count,
-                "activeProfiles": profiles.filter({ $0.isActive }).count,
-                "totalMediaIndexed": dm.totalDownloaded,
-                "currentActivity": dm.currentActivity
-            ]
-            self?.sendJSON(connection: connection, json: json)
-        }
+        let json: [String: Any] = [
+            "isDownloading": dm.isRunning,
+            "totalProfiles": profiles.count,
+            "activeProfiles": profiles.filter({ $0.isActive }).count,
+            "totalMediaIndexed": dm.totalDownloaded,
+            "currentActivity": dm.currentActivity
+        ]
+        self.sendJSON(connection: connection, json: json)
     }
 
     // MARK: - Sync Handlers
 
     private func handleSyncAll(connection: NWConnection) {
-        DispatchQueue.main.async { [weak self] in
-            guard let store = self?.profileStore else {
-                self?.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
-                return
-            }
+        guard let store = self.profileStore else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
+        }
 
-            let dm = DownloadManager.shared
-            if dm.isRunning {
-                self?.sendJSON(connection: connection, json: ["success": true, "message": "Sync already running"])
-            } else {
-                dm.checkAllProfiles(profileStore: store)
-                self?.sendJSON(connection: connection, json: ["success": true, "message": "Sync started for all profiles"])
-            }
+        let dm = DownloadManager.shared
+        if dm.isRunning {
+            self.sendJSON(connection: connection, json: ["success": true, "message": "Sync already running"])
+        } else {
+            dm.checkAllProfiles(profileStore: store)
+            self.sendJSON(connection: connection, json: ["success": true, "message": "Sync started for all profiles"])
         }
     }
 
     private func handleSyncProfile(username: String, connection: NWConnection) {
         let clean = (username.removingPercentEncoding ?? username).lowercased()
 
-        DispatchQueue.main.async { [weak self] in
-            guard let store = self?.profileStore else {
-                self?.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
-                return
-            }
-
-            guard let profile = store.profiles.first(where: { $0.username == clean }) else {
-                self?.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
-                return
-            }
-
-            let dm = DownloadManager.shared
-            if dm.activeUsernames.contains(clean) {
-                self?.sendJSON(connection: connection, json: ["success": true, "message": "Already syncing @\(clean)"])
-            } else {
-                dm.checkProfile(profile, profileStore: store)
-                self?.sendJSON(connection: connection, json: ["success": true, "message": "Sync started for @\(clean)"])
-            }
+        guard let store = self.profileStore else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
         }
+
+        guard let profile = store.profiles.first(where: { $0.username == clean }) else {
+            self.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
+            return
+        }
+
+        let dm = DownloadManager.shared
+        if dm.activeUsernames.contains(clean) {
+            self.sendJSON(connection: connection, json: ["success": true, "message": "Already syncing @\(clean)"])
+        } else {
+            dm.checkProfile(profile, profileStore: store)
+            self.sendJSON(connection: connection, json: ["success": true, "message": "Sync started for @\(clean)"])
+        }
+    }
+
+    private func handleRefreshProfile(username: String, connection: NWConnection) {
+        let clean = (username.removingPercentEncoding ?? username).lowercased()
+
+        guard let store = self.profileStore else {
+            self.sendJSON(connection: connection, status: "500 Internal Server Error", json: ["error": "No profile store"])
+            return
+        }
+
+        guard let profile = store.profiles.first(where: { $0.username == clean }) else {
+            self.sendJSON(connection: connection, status: "404 Not Found", json: ["error": "Profile not found"])
+            return
+        }
+
+        DownloadManager.shared.refreshProfile(profile, profileStore: store)
+        self.sendJSON(connection: connection, json: ["success": true, "message": "Refreshing @\(clean) — re-downloading all posts"])
     }
 
     // MARK: - HTML Pages
@@ -738,6 +746,7 @@ class WebServer: ObservableObject {
 
         <div class="detail-actions">
           <button class="btn btn-sm btn-sync" id="detailSyncBtn" onclick="syncDetail()">Sync Now</button>
+          <button class="btn btn-sm btn-outline" id="detailRefreshBtn" onclick="refreshDetail()">Refresh</button>
           <button class="btn btn-sm btn-danger" id="detailRemoveBtn" onclick="removeDetail()">Remove</button>
           <a id="detailIGLink" class="btn btn-sm btn-outline" target="_blank" rel="noopener">View on Instagram</a>
         </div>
@@ -804,6 +813,7 @@ class WebServer: ObservableObject {
           </div>
           ${statusBadge(p)}
           <button class="btn btn-sm btn-sync" onclick="event.stopPropagation(); syncProfile('${p.username}')">Sync</button>
+          <button class="btn btn-sm btn-outline" onclick="event.stopPropagation(); refreshProfile('${p.username}')">Refresh</button>
           <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); removeProfile('${p.username}')">Remove</button>
         </div>
       `).join('');
@@ -856,6 +866,16 @@ class WebServer: ObservableObject {
         showToast(data.message, 'success');
         setTimeout(loadProfiles, 1000);
       } catch { showToast('Failed to start sync', 'error'); }
+    }
+
+    async function refreshProfile(username) {
+      if (!confirm('Refresh @' + username + '? This will delete and re-download all posts (stories are kept).')) return;
+      try {
+        const res = await fetch('/api/refresh/' + username, { method: 'POST' });
+        const data = await res.json();
+        showToast(data.message, 'success');
+        setTimeout(loadProfiles, 1000);
+      } catch { showToast('Failed to start refresh', 'error'); }
     }
 
     async function syncAll() {
@@ -964,6 +984,13 @@ class WebServer: ObservableObject {
     async function syncDetail() {
       if (!currentDetail) return;
       await syncProfile(currentDetail);
+      setTimeout(() => showDetail(currentDetail), 1500);
+    }
+
+    async function refreshDetail() {
+      if (!currentDetail) return;
+      if (!confirm('Refresh @' + currentDetail + '? This will delete and re-download all posts (stories are kept).')) return;
+      await refreshProfile(currentDetail);
       setTimeout(() => showDetail(currentDetail), 1500);
     }
 

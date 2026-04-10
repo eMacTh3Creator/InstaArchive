@@ -23,6 +23,7 @@ struct SidebarView: View {
     let onCheckAll: () -> Void
     let onGoHome: () -> Void
     let onSyncSelected: (Set<UUID>) -> Void
+    let onRefreshSelected: (Set<UUID>) -> Void
     let onDeleteSelected: (Set<UUID>) -> Void
     let onSetSchedule: (Set<UUID>, Int?) -> Void
 
@@ -278,6 +279,10 @@ struct SidebarView: View {
 
         Button(action: { onSyncSelected(targetIds) }) {
             Label("Sync \(label)", systemImage: "arrow.clockwise")
+        }
+
+        Button(action: { onRefreshSelected(targetIds) }) {
+            Label("Refresh \(label)", systemImage: "arrow.triangle.2.circlepath")
         }
 
         Divider()

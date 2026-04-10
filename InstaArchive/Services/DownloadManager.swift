@@ -39,23 +39,52 @@ enum DownloadStatus: Equatable {
     }
 }
 
-/// Manages the download queue and orchestrates fetching from Instagram
-class DownloadManager: ObservableObject {
+/// Manages the download queue and orchestrates fetching from Instagram.
+///
+/// IMPORTANT: No view observes this object via @EnvironmentObject or @ObservedObject.
+/// All UI state is polled by timers in SidebarView/SidebarBottomBar/ProfileDetailView.
+/// Therefore NO code in this class needs to run on MainActor. All state is protected
+/// by `stateLock` and can be read/written from any thread.
+final class DownloadManager: ObservableObject, @unchecked Sendable {
     static let shared = DownloadManager()
 
     // ---------------------------------------------------------------
-    // UI-visible state — NOT @Published. objectWillChange is ONLY
-    // sent for state transitions (start/stop/complete/error), NEVER
-    // for progress ticks. This prevents 180-row sidebar re-renders
-    // every few hundred milliseconds during downloads.
-    //
-    // The bottom bar polls `currentActivity` on its own timer.
+    // UI-visible state — protected by stateLock, polled by view timers.
+    // ZERO MainActor involvement. Views poll every 1-2 seconds.
     // ---------------------------------------------------------------
-    var profileStatuses: [String: DownloadStatus] = [:]
-    var isRunning = false
-    var currentActivity: String = ""
-    var totalNewItems: Int = 0
-    var activeUsernames: Set<String> = []
+    private let stateLock = NSLock()
+    private var _profileStatuses: [String: DownloadStatus] = [:]
+    private var _isRunning = false
+    private var _currentActivity: String = ""
+    private var _totalNewItems: Int = 0
+    private var _activeUsernames: Set<String> = []
+
+    // Thread-safe accessors for UI polling
+    var profileStatuses: [String: DownloadStatus] {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _profileStatuses
+    }
+    var isRunning: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _isRunning
+    }
+    var currentActivity: String {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _currentActivity
+    }
+    var totalNewItems: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _totalNewItems
+    }
+    var activeUsernames: Set<String> {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _activeUsernames
+    }
 
     private let instagram = InstagramService.shared
     private let storage = StorageManager.shared
@@ -80,21 +109,51 @@ class DownloadManager: ObservableObject {
         rebuildIdIndex()
     }
 
-    // MARK: - UI Publishing
-    //
-    // Only call publishTransition() for real state changes that the
-    // sidebar rows or detail view need to react to:
-    //   - isRunning changed
-    //   - profileStatuses[x] transitioned between cases (idle→checking, etc.)
-    //   - activeUsernames changed
-    //
-    // Do NOT publish for:
-    //   - currentActivity text updates (bottom bar polls these)
-    //   - download progress within .downloading state
+    // MARK: - State Helpers (all lock-protected, never MainActor)
 
-    @MainActor
-    private func publishTransition() {
-        objectWillChange.send()
+    private func setStatus(_ status: DownloadStatus, for username: String) {
+        stateLock.lock()
+        _profileStatuses[username] = status
+        stateLock.unlock()
+    }
+
+    private func setActivity(_ text: String) {
+        stateLock.lock()
+        _currentActivity = text
+        stateLock.unlock()
+    }
+
+    private func markRunning(username: String) {
+        stateLock.lock()
+        _isRunning = true
+        _activeUsernames.insert(username)
+        _profileStatuses[username] = .checking
+        _currentActivity = "Checking @\(username)..."
+        stateLock.unlock()
+    }
+
+    private func markFinished(username: String) {
+        stateLock.lock()
+        _activeUsernames.remove(username)
+        if _activeUsernames.isEmpty {
+            _isRunning = false
+            _currentActivity = ""
+        }
+        stateLock.unlock()
+    }
+
+    private func markAllStopped() {
+        stateLock.lock()
+        _activeUsernames.removeAll()
+        _isRunning = false
+        _currentActivity = ""
+        stateLock.unlock()
+    }
+
+    private func addTotalNewItems(_ count: Int) {
+        stateLock.lock()
+        _totalNewItems += count
+        stateLock.unlock()
     }
 
     // MARK: - Index Management
@@ -104,7 +163,6 @@ class DownloadManager: ObservableObject {
     }
 
     /// Validate the media index by pruning entries whose files no longer exist.
-    /// Runs entirely on a background queue — does NOT block the main thread.
     private func validateIndexAsync() async {
         await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
             ioQueue.async { [self] in
@@ -132,7 +190,20 @@ class DownloadManager: ObservableObject {
         downloadedMedia.removeAll { $0.profileUsername == username }
         rebuildIdIndex()
         mediaLock.unlock()
-        // Save on background
+        let snapshot = downloadedMedia
+        ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
+    }
+
+    /// Remove media index entries for a profile, but keep stories and highlights
+    func removePostsIndex(for username: String) {
+        mediaLock.lock()
+        downloadedMedia.removeAll {
+            $0.profileUsername == username &&
+            $0.mediaType != .story &&
+            $0.mediaType != .highlight
+        }
+        rebuildIdIndex()
+        mediaLock.unlock()
         let snapshot = downloadedMedia
         ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
     }
@@ -142,37 +213,21 @@ class DownloadManager: ObservableObject {
     func skipProfile(_ username: String) {
         profileTasks[username]?.cancel()
         profileTasks.removeValue(forKey: username)
-        Task { @MainActor in
-            self.profileStatuses[username] = .skipped
-            self.activeUsernames.remove(username)
-            if self.activeUsernames.isEmpty {
-                self.isRunning = false
-                self.currentActivity = ""
-            }
-            self.publishTransition()
-        }
+        setStatus(.skipped, for: username)
+        markFinished(username: username)
     }
 
     func stopAll() {
         stopAllRequested = true
         checkAllTask?.cancel()
-        for (username, task) in profileTasks {
-            task.cancel()
-            Task { @MainActor in
-                if case .downloading = self.profileStatuses[username] {
-                    self.profileStatuses[username] = .skipped
-                } else if case .checking = self.profileStatuses[username] {
-                    self.profileStatuses[username] = .skipped
-                }
-            }
+        stateLock.lock()
+        for username in _activeUsernames {
+            _profileStatuses[username] = .skipped
         }
+        stateLock.unlock()
+        for (_, task) in profileTasks { task.cancel() }
         profileTasks.removeAll()
-        Task { @MainActor in
-            self.activeUsernames.removeAll()
-            self.isRunning = false
-            self.currentActivity = ""
-            self.publishTransition()
-        }
+        markAllStopped()
     }
 
     // MARK: - Thread-safe media index helpers
@@ -201,20 +256,11 @@ class DownloadManager: ObservableObject {
         }
     }
 
-    /// Save the media index on a background queue — never blocks the calling thread.
     private func saveIndexAsync() {
         mediaLock.lock()
         let snapshot = downloadedMedia
         mediaLock.unlock()
         ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
-    }
-
-    /// Save synchronously (only for final saves before returning from performCheck).
-    private func saveIndexSync() {
-        mediaLock.lock()
-        let snapshot = downloadedMedia
-        mediaLock.unlock()
-        storage.saveMediaIndex(snapshot)
     }
 
     private func currentKnownIds() -> Set<String> {
@@ -226,9 +272,9 @@ class DownloadManager: ObservableObject {
     // MARK: - Check single profile
 
     func checkProfile(_ profile: Profile, profileStore: ProfileStore) {
-        guard !activeUsernames.contains(profile.username) else { return }
+        let active = activeUsernames
+        guard !active.contains(profile.username) else { return }
 
-        // Use .detached to guarantee we don't inherit MainActor context
         let task = Task.detached(priority: .userInitiated) { [self] in
             await performCheck(profile, profileStore: profileStore)
         }
@@ -236,7 +282,6 @@ class DownloadManager: ObservableObject {
     }
 
     /// Sync a batch of specific profiles (for multi-select).
-    /// Uses sequential processing with delays to avoid bot detection.
     func checkProfiles(_ profiles: [Profile], profileStore: ProfileStore) {
         let shuffled = profiles.shuffled()
         checkAllTask = Task.detached(priority: .userInitiated) { [self] in
@@ -244,34 +289,53 @@ class DownloadManager: ObservableObject {
                 if stopAllRequested || Task.isCancelled { break }
                 await self.performCheck(profile, profileStore: profileStore)
                 if stopAllRequested || Task.isCancelled { break }
-                // Inter-profile delay for batches > 1
                 if shuffled.count > 1 && index < shuffled.count - 1 {
                     let cooldown = Double.random(in: 20...60)
                     try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
                 }
             }
-            await MainActor.run {
-                self.isRunning = false
-                self.currentActivity = ""
-                self.publishTransition()
-            }
+            self.markAllStopped()
         }
+    }
+
+    /// Refresh a profile: delete posts/reels/videos/profilePic files + index, keep stories/highlights, then re-sync.
+    func refreshProfile(_ profile: Profile, profileStore: ProfileStore) {
+        let username = profile.username
+        log.info("Refreshing @\(username): deleting posts, keeping stories/highlights", context: "refresh")
+
+        // Remove posts from index (keep stories/highlights)
+        removePostsIndex(for: username)
+
+        // Delete post/reel/video/profilePic files from disk
+        let postTypes: [MediaType] = [.post, .reel, .video, .profilePic]
+        for type in postTypes {
+            let dir = settings.mediaDirectory(for: username, type: type)
+            try? FileManager.default.removeItem(at: dir)
+            storage.createProfileDirectories(for: username)
+        }
+
+        // Reset total downloaded count to stories+highlights count
+        mediaLock.lock()
+        let remainingCount = downloadedMedia.filter { $0.profileUsername == username }.count
+        mediaLock.unlock()
+
+        if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
+            profileStore.profiles[idx].totalDownloaded = remainingCount
+            profileStore.profiles[idx].lastChecked = nil
+            profileStore.saveAll()
+        }
+
+        // Start re-sync
+        checkProfile(profile, profileStore: profileStore)
     }
 
     private func performCheck(_ profile: Profile, profileStore: ProfileStore) async {
         let username = profile.username
 
-        await MainActor.run {
-            self.isRunning = true
-            self.activeUsernames.insert(username)
-            self.profileStatuses[username] = .checking
-            self.currentActivity = "Checking @\(username)..."
-            self.publishTransition()
-        }
-
+        markRunning(username: username)
         log.info("Starting check for @\(username)", context: "check")
 
-        // Validate index on background — does NOT block main thread
+        // Validate index on background
         await validateIndexAsync()
 
         do {
@@ -298,10 +362,7 @@ class DownloadManager: ObservableObject {
 
             // 3. Posts with full pagination
             try Task.checkCancellation()
-            await MainActor.run {
-                self.currentActivity = "Fetching posts for @\(username)..."
-                // Bottom bar polls currentActivity — no objectWillChange needed
-            }
+            setActivity("Fetching posts for @\(username)...")
             log.info("Fetching posts for @\(username)", context: "check")
             do {
                 let posts = try await instagram.fetchAllMedia(
@@ -318,10 +379,7 @@ class DownloadManager: ObservableObject {
             // 4. Stories (non-fatal)
             try Task.checkCancellation()
             if settings.downloadStories, !profileInfo.userId.isEmpty {
-                await MainActor.run {
-                    self.currentActivity = "Fetching stories for @\(username)..."
-                    // Bottom bar polls currentActivity — no objectWillChange needed
-                }
+                setActivity("Fetching stories for @\(username)...")
                 do {
                     let stories = try await instagram.fetchStories(
                         userId: profileInfo.userId, username: username
@@ -337,10 +395,7 @@ class DownloadManager: ObservableObject {
             // 5. Highlights (non-fatal)
             try Task.checkCancellation()
             if settings.downloadHighlights, !profileInfo.userId.isEmpty {
-                await MainActor.run {
-                    self.currentActivity = "Fetching highlights for @\(username)..."
-                    // Bottom bar polls currentActivity — no objectWillChange needed
-                }
+                setActivity("Fetching highlights for @\(username)...")
                 do {
                     let highlights = try await instagram.fetchHighlights(
                         userId: profileInfo.userId, username: username
@@ -397,7 +452,6 @@ class DownloadManager: ObservableObject {
 
                     let savePath = storage.savePath(for: media, username: username, index: index)
 
-                    // Re-index files that exist on disk but not in index
                     if FileManager.default.fileExists(atPath: savePath.path) {
                         let fileSize = (try? FileManager.default.attributesOfItem(atPath: savePath.path)[.size] as? Int64) ?? 0
                         let mediaItem = MediaItem(
@@ -470,11 +524,8 @@ class DownloadManager: ObservableObject {
 
                         if completed % 5 == 0 || completed == totalToDownload {
                             let progress = Double(completed) / Double(totalToDownload)
-                            await MainActor.run {
-                                self.profileStatuses[username] = .downloading(progress: progress)
-                                self.currentActivity = "Downloading @\(username) (\(completed)/\(totalToDownload))..."
-                                // Bottom bar polls currentActivity — no objectWillChange needed
-                            }
+                            self.setStatus(.downloading(progress: progress), for: username)
+                            self.setActivity("Downloading @\(username) (\(completed)/\(totalToDownload))...")
                         }
                     }
                 }
@@ -485,7 +536,6 @@ class DownloadManager: ObservableObject {
             let newItemCount = newItemCounter.value
             let failedCount = failedCounter.value
 
-            // Final save on background
             saveIndexAsync()
 
             let finalNewItemCount = newItemCount
@@ -495,104 +545,73 @@ class DownloadManager: ObservableObject {
 
             log.info("@\(username) complete: \(finalNewItemCount) new, \(failedCount) failed", context: "check")
 
-            await MainActor.run {
-                if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
-                    profileStore.profiles[idx].lastChecked = Date()
-                    profileStore.profiles[idx].totalDownloaded += finalNewItemCount
-                    if finalNewItemCount > 0 {
-                        profileStore.profiles[idx].lastNewContent = Date()
-                    }
-                    profileStore.saveAll()
+            // Update profile store on background — saveAll handles its own threading
+            if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
+                profileStore.profiles[idx].lastChecked = Date()
+                profileStore.profiles[idx].totalDownloaded += finalNewItemCount
+                if finalNewItemCount > 0 {
+                    profileStore.profiles[idx].lastNewContent = Date()
                 }
-                self.profileStatuses[username] = .completed(newItems: finalNewItemCount)
-                self.totalNewItems += finalNewItemCount
-                self.publishTransition()
+                profileStore.saveAll()
             }
+            setStatus(.completed(newItems: finalNewItemCount), for: username)
+            addTotalNewItems(finalNewItemCount)
 
         } catch is CancellationError {
             saveIndexAsync()
             log.info("Download cancelled for @\(username)", context: "check")
-            await MainActor.run {
-                if self.profileStatuses[username] != .skipped {
-                    self.profileStatuses[username] = .skipped
-                }
-                self.publishTransition()
-            }
+            let current = profileStatuses[username]
+            if current != .skipped { setStatus(.skipped, for: username) }
         } catch let error as InstagramError {
             saveIndexAsync()
             log.error("Check failed for @\(username): \(error.localizedDescription)", context: "check")
             if case .sessionError = error {
                 instagram.resetSession()
-                await MainActor.run { AppSettings.shared.isLoggedIn = false }
+                AppSettings.shared.isLoggedIn = false
             }
-            await MainActor.run {
-                self.profileStatuses[username] = .error(error.localizedDescription)
-                self.publishTransition()
-            }
+            setStatus(.error(error.localizedDescription), for: username)
         } catch {
             saveIndexAsync()
             let msg = "\(error.localizedDescription)"
             log.error("Unexpected error for @\(username): \(msg)", context: "check")
-            await MainActor.run {
-                self.profileStatuses[username] = .error(msg)
-                self.publishTransition()
-            }
+            setStatus(.error(msg), for: username)
         }
 
         profileTasks.removeValue(forKey: username)
-        await MainActor.run {
-            self.activeUsernames.remove(username)
-            if self.activeUsernames.isEmpty {
-                self.isRunning = false
-                self.currentActivity = ""
-            }
-            self.publishTransition()
-        }
+        markFinished(username: username)
     }
 
     // MARK: - Check all profiles (sequential with anti-detection)
 
     func checkAllProfiles(profileStore: ProfileStore) {
         stopAllRequested = false
-        var activeProfiles = profileStore.profiles.filter { $0.isActive }
+        let activeProfiles = profileStore.profiles.filter { $0.isActive }
         guard !activeProfiles.isEmpty else { return }
 
-        // Shuffle to avoid predictable ordering — a key bot signal
         let shuffledProfiles = activeProfiles.shuffled()
 
         checkAllTask = Task.detached(priority: .userInitiated) { [self] in
-            let activeProfiles = shuffledProfiles
-            // Mass sync: process ONE profile at a time with delays between them.
-            // Concurrent profile checks multiply API requests and are the #1
-            // trigger for Instagram's automated bot detection.
-            let batchSize = 10  // Profiles per batch before a longer cooldown
+            let profiles = shuffledProfiles
+            let batchSize = 10
             var completedInBatch = 0
 
-            for (index, profile) in activeProfiles.enumerated() {
+            for (index, profile) in profiles.enumerated() {
                 if stopAllRequested || Task.isCancelled { break }
 
-                await MainActor.run {
-                    self.currentActivity = "Queue: \(index + 1)/\(activeProfiles.count) — @\(profile.username)"
-                    // Bottom bar polls currentActivity — no objectWillChange needed
-                }
+                self.setActivity("Queue: \(index + 1)/\(profiles.count) — @\(profile.username)")
 
                 await self.performCheck(profile, profileStore: profileStore)
                 completedInBatch += 1
 
                 if stopAllRequested || Task.isCancelled { break }
 
-                // Inter-profile cooldown: random 20-60 seconds
-                if index < activeProfiles.count - 1 {
+                if index < profiles.count - 1 {
                     let cooldown: Double
                     if completedInBatch >= batchSize {
-                        // Batch cooldown: every 10 profiles, take a 3-7 minute break
                         cooldown = Double.random(in: 180...420)
                         completedInBatch = 0
                         self.log.info("Batch cooldown: pausing \(Int(cooldown))s after \(batchSize) profiles", context: "rate")
-                        await MainActor.run {
-                            self.currentActivity = "Cooldown before next batch (\(Int(cooldown))s)..."
-                            // Bottom bar polls currentActivity — no objectWillChange needed
-                        }
+                        self.setActivity("Cooldown before next batch (\(Int(cooldown))s)...")
                     } else {
                         cooldown = Double.random(in: 20...60)
                     }
@@ -600,24 +619,18 @@ class DownloadManager: ObservableObject {
                 }
             }
 
-            await MainActor.run {
-                self.isRunning = false
-                self.currentActivity = ""
-                self.publishTransition()
-            }
+            self.markAllStopped()
         }
     }
 
     // MARK: - Query
 
-    /// Returns items for a profile. For large indexes, call from background.
     func mediaItems(for username: String) -> [MediaItem] {
         mediaLock.lock()
         defer { mediaLock.unlock() }
         return downloadedMedia.filter { $0.profileUsername == username }
     }
 
-    /// Async variant that filters on a background queue — safe to call from UI.
     func mediaItemsAsync(for username: String) async -> [MediaItem] {
         await withCheckedContinuation { cont in
             ioQueue.async { [self] in
@@ -635,10 +648,8 @@ class DownloadManager: ObservableObject {
         return downloadedMedia.count
     }
 
-    @MainActor
     func clearStatus(for username: String) {
-        profileStatuses[username] = .idle
-        publishTransition()
+        setStatus(.idle, for: username)
     }
 
     func reloadIndex() {

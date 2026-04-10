@@ -30,6 +30,7 @@ Both versions share the same core feature set:
 - **Export/Import** — save and load your profile list as JSON
 - **Per-profile stats** — media counts by type, storage usage, last checked time
 - **Sync controls** — trigger sync for one profile or all at once
+- **Profile refresh** — re-download full posts while keeping time-sensitive stories/highlights
 
 ---
 
@@ -143,6 +144,7 @@ Both platforms expose the same REST API at `http://localhost:8485`:
 | `GET` | `/api/status` | App status (downloading, counts) |
 | `POST` | `/api/sync/all` | Sync all profiles |
 | `POST` | `/api/sync/{username}` | Sync one profile |
+| `POST` | `/api/refresh/{username}` | Delete and re-download posts for one profile |
 | `GET` | `/api/settings` | Get current settings |
 | `POST` | `/api/settings` | Update settings |
 | `GET` | `/api/export` | Download profiles as JSON |

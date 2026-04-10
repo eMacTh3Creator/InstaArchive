@@ -37,6 +37,7 @@ struct ContentView: View {
                 onCheckAll: checkAll,
                 onGoHome: { selectedProfile = nil },
                 onSyncSelected: syncSelected,
+                onRefreshSelected: refreshSelected,
                 onDeleteSelected: { ids in
                     pendingDeleteIds = ids
                     showingDeleteConfirmation = true
@@ -48,7 +49,8 @@ struct ContentView: View {
             if let profile = selectedProfile {
                 ProfileDetailView(
                     profile: binding(for: profile),
-                    onDelete: { selectedProfile = nil }
+                    onDelete: { selectedProfile = nil },
+                    onRefresh: { refreshProfile(profile) }
                 )
             } else {
                 HomeView()
@@ -112,6 +114,17 @@ struct ContentView: View {
     private func syncSelected(_ ids: Set<UUID>) {
         let profiles = profileStore.profiles.filter { ids.contains($0.id) }
         DownloadManager.shared.checkProfiles(profiles, profileStore: profileStore)
+    }
+
+    private func refreshSelected(_ ids: Set<UUID>) {
+        let profiles = profileStore.profiles.filter { ids.contains($0.id) }
+        for profile in profiles {
+            DownloadManager.shared.refreshProfile(profile, profileStore: profileStore)
+        }
+    }
+
+    private func refreshProfile(_ profile: Profile) {
+        DownloadManager.shared.refreshProfile(profile, profileStore: profileStore)
     }
 
     private func setSchedule(_ ids: Set<UUID>, _ hours: Int?) {

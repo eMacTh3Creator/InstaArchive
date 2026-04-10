@@ -15,6 +15,7 @@ struct ProfileDetailView: View {
     @State private var currentStatus: DownloadStatus = .idle
     @State private var statusTimer: Timer?
     var onDelete: (() -> Void)? = nil
+    var onRefresh: (() -> Void)? = nil
 
     /// Load media on demand — only when user taps "Show Media".
     /// Cancels any in-flight load to prevent stale data from a previous profile.
@@ -256,6 +257,13 @@ struct ProfileDetailView: View {
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                     }
+
+                    Button(action: { onRefresh?() }) {
+                        Label("Refresh", systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Re-download all posts (keeps stories)")
 
                     Button(action: openInFinder) {
                         Image(systemName: "folder")
