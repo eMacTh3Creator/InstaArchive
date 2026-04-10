@@ -14,6 +14,10 @@ struct ContentView: View {
     @State private var sortOption: ProfileSortOption = .name
     @State private var sortAscending = true
 
+    private var multiSelectedProfiles: [Profile] {
+        profileStore.profiles.filter { selectedProfileIds.contains($0.id) }
+    }
+
     var filteredProfiles: [Profile] {
         if searchText.isEmpty {
             return profileStore.profiles
@@ -46,7 +50,14 @@ struct ContentView: View {
             )
             .navigationSplitViewColumnWidth(min: 220, ideal: 260, max: 340)
         } detail: {
-            if let profile = selectedProfile {
+            if !selectedProfileIds.isEmpty {
+                MultiSelectionDetailView(
+                    profiles: multiSelectedProfiles,
+                    onSync: { syncSelected(selectedProfileIds) },
+                    onRefresh: { refreshSelected(selectedProfileIds) },
+                    onClearSelection: { selectedProfileIds.removeAll() }
+                )
+            } else if let profile = selectedProfile {
                 ProfileDetailView(
                     profile: binding(for: profile),
                     onDelete: { selectedProfile = nil },
@@ -68,7 +79,10 @@ struct ContentView: View {
         }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
-                Button(action: { selectedProfile = nil }) {
+                Button(action: {
+                    selectedProfile = nil
+                    selectedProfileIds.removeAll()
+                }) {
                     Image(systemName: "house")
                 }
                 .help("Home (\u{21E7}\u{2318}H)")
@@ -156,6 +170,70 @@ struct ContentView: View {
             return .constant(profile)
         }
         return $profileStore.profiles[index]
+    }
+}
+
+struct MultiSelectionDetailView: View {
+    let profiles: [Profile]
+    let onSync: () -> Void
+    let onRefresh: () -> Void
+    let onClearSelection: () -> Void
+
+    private var profileNames: String {
+        let names = profiles.prefix(5).map { "@\($0.username)" }
+        let suffix = profiles.count > names.count ? " +\(profiles.count - names.count) more" : ""
+        return names.joined(separator: ", ") + suffix
+    }
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Spacer()
+
+            Image(systemName: "person.2.crop.square.stack")
+                .font(.system(size: 48, weight: .thin))
+                .foregroundColor(.secondary)
+
+            VStack(spacing: 6) {
+                Text("\(profiles.count) profile\(profiles.count == 1 ? "" : "s") selected")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+
+                if !profiles.isEmpty {
+                    Text(profileNames)
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button(action: onSync) {
+                    Label("Sync Selected", systemImage: "arrow.clockwise")
+                }
+                .buttonStyle(.borderedProminent)
+
+                Button(action: onRefresh) {
+                    Label("Refresh Selected", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .buttonStyle(.bordered)
+
+                Button(action: onClearSelection) {
+                    Label("Clear Selection", systemImage: "xmark")
+                }
+                .buttonStyle(.bordered)
+            }
+            .controlSize(.large)
+
+            Text("Choose Home to return to the neutral dashboard, or click a single profile to inspect its archive.")
+                .font(.system(size: 12))
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(32)
     }
 }
 

@@ -205,6 +205,9 @@ struct SidebarView: View {
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 if NSEvent.modifierFlags.contains(.command) {
+                                    if selectedProfileIds.isEmpty, let current = selectedProfile {
+                                        selectedProfileIds.insert(current.id)
+                                    }
                                     if selectedProfileIds.contains(profile.id) {
                                         selectedProfileIds.remove(profile.id)
                                     } else {
