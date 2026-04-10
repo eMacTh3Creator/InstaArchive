@@ -228,3 +228,8 @@ MIT License. See [LICENSE](LICENSE) for details.
 ## Disclaimer
 
 For personal archiving only. Respect Instagram's Terms of Service and the privacy of content creators. Only archive content you have permission to save.
+
+## Contributors
+
+- Everett Jenkins
+- OpenAI Codex

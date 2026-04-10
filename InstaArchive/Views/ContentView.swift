@@ -118,9 +118,7 @@ struct ContentView: View {
 
     private func refreshSelected(_ ids: Set<UUID>) {
         let profiles = profileStore.profiles.filter { ids.contains($0.id) }
-        for profile in profiles {
-            DownloadManager.shared.refreshProfile(profile, profileStore: profileStore)
-        }
+        DownloadManager.shared.refreshProfiles(profiles, profileStore: profileStore)
     }
 
     private func refreshProfile(_ profile: Profile) {

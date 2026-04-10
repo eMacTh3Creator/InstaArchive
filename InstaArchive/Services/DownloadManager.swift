@@ -298,34 +298,63 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         }
     }
 
+    func refreshProfiles(_ profiles: [Profile], profileStore: ProfileStore) {
+        let uniqueProfiles = Array(
+            Dictionary(uniqueKeysWithValues: profiles.map { ($0.id, $0) }).values
+        )
+        guard !uniqueProfiles.isEmpty else { return }
+
+        Task.detached(priority: .userInitiated) { [self] in
+            for profile in uniqueProfiles {
+                if Task.isCancelled { break }
+                await performRefresh(profile, profileStore: profileStore)
+            }
+        }
+    }
+
     /// Refresh a profile: delete posts/reels/videos/profilePic files + index, keep stories/highlights, then re-sync.
     func refreshProfile(_ profile: Profile, profileStore: ProfileStore) {
+        refreshProfiles([profile], profileStore: profileStore)
+    }
+
+    private func performRefresh(_ profile: Profile, profileStore: ProfileStore) async {
         let username = profile.username
+        let active = activeUsernames
+        guard !active.contains(username) else { return }
+
         log.info("Refreshing @\(username): deleting posts, keeping stories/highlights", context: "refresh")
+        setStatus(.checking, for: username)
+        setActivity("Preparing refresh for @\(username)...")
 
-        // Remove posts from index (keep stories/highlights)
-        removePostsIndex(for: username)
+        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
+            ioQueue.async { [self] in
+                removePostsIndex(for: username)
 
-        // Delete post/reel/video/profilePic files from disk
-        let postTypes: [MediaType] = [.post, .reel, .video, .profilePic]
-        for type in postTypes {
-            let dir = settings.mediaDirectory(for: username, type: type)
-            try? FileManager.default.removeItem(at: dir)
-            storage.createProfileDirectories(for: username)
+                let postTypes: [MediaType] = [.post, .reel, .video, .profilePic]
+                for type in postTypes {
+                    let dir = settings.mediaDirectory(for: username, type: type)
+                    try? FileManager.default.removeItem(at: dir)
+                }
+                storage.createProfileDirectories(for: username)
+                cont.resume()
+            }
         }
 
-        // Reset total downloaded count to stories+highlights count
-        mediaLock.lock()
-        let remainingCount = downloadedMedia.filter { $0.profileUsername == username }.count
-        mediaLock.unlock()
+        let remainingCount: Int = {
+            mediaLock.lock()
+            defer { mediaLock.unlock() }
+            return downloadedMedia.filter { $0.profileUsername == username }.count
+        }()
 
-        if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
-            profileStore.profiles[idx].totalDownloaded = remainingCount
-            profileStore.profiles[idx].lastChecked = nil
-            profileStore.saveAll()
+        await MainActor.run {
+            if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
+                profileStore.profiles[idx].totalDownloaded = remainingCount
+                profileStore.profiles[idx].lastChecked = nil
+                profileStore.saveAll()
+            }
         }
 
-        // Start re-sync
+        clearStatus(for: username)
         checkProfile(profile, profileStore: profileStore)
     }
 
@@ -545,14 +574,15 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
 
             log.info("@\(username) complete: \(finalNewItemCount) new, \(failedCount) failed", context: "check")
 
-            // Update profile store on background — saveAll handles its own threading
-            if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
-                profileStore.profiles[idx].lastChecked = Date()
-                profileStore.profiles[idx].totalDownloaded += finalNewItemCount
-                if finalNewItemCount > 0 {
-                    profileStore.profiles[idx].lastNewContent = Date()
+            await MainActor.run {
+                if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
+                    profileStore.profiles[idx].lastChecked = Date()
+                    profileStore.profiles[idx].totalDownloaded += finalNewItemCount
+                    if finalNewItemCount > 0 {
+                        profileStore.profiles[idx].lastNewContent = Date()
+                    }
+                    profileStore.saveAll()
                 }
-                profileStore.saveAll()
             }
             setStatus(.completed(newItems: finalNewItemCount), for: username)
             addTotalNewItems(finalNewItemCount)
