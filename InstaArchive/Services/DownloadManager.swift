@@ -191,21 +191,30 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         rebuildIdIndex()
         mediaLock.unlock()
         let snapshot = downloadedMedia
-        ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
+        saveIndexSnapshotAsync(snapshot)
     }
 
     /// Remove media index entries for a profile, but keep stories and highlights
     func removePostsIndex(for username: String) {
+        let (snapshot, _) = prunePostsIndex(for: [username])
+        saveIndexSnapshotAsync(snapshot)
+    }
+
+    private func prunePostsIndex(for usernames: Set<String>) -> ([MediaItem], [String: Int]) {
         mediaLock.lock()
         downloadedMedia.removeAll {
-            $0.profileUsername == username &&
+            usernames.contains($0.profileUsername) &&
             $0.mediaType != .story &&
             $0.mediaType != .highlight
         }
         rebuildIdIndex()
-        mediaLock.unlock()
         let snapshot = downloadedMedia
-        ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
+        let remainingCounts = downloadedMedia.reduce(into: [String: Int]()) { counts, item in
+            guard usernames.contains(item.profileUsername) else { return }
+            counts[item.profileUsername, default: 0] += 1
+        }
+        mediaLock.unlock()
+        return (snapshot, remainingCounts)
     }
 
     // MARK: - Cancellation
@@ -260,6 +269,10 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         mediaLock.lock()
         let snapshot = downloadedMedia
         mediaLock.unlock()
+        saveIndexSnapshotAsync(snapshot)
+    }
+
+    private func saveIndexSnapshotAsync(_ snapshot: [MediaItem]) {
         ioQueue.async { [self] in storage.saveMediaIndex(snapshot) }
     }
 
@@ -305,9 +318,45 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         guard !uniqueProfiles.isEmpty else { return }
 
         Task.detached(priority: .userInitiated) { [self] in
-            for profile in uniqueProfiles {
-                if Task.isCancelled { break }
-                await performRefresh(profile, profileStore: profileStore)
+            let refreshableProfiles = uniqueProfiles.filter { !activeUsernames.contains($0.username) }
+            guard !refreshableProfiles.isEmpty else { return }
+
+            let usernames = Set(refreshableProfiles.map(\.username))
+            for username in usernames {
+                setStatus(.checking, for: username)
+            }
+            setActivity("Preparing \(refreshableProfiles.count) refresh\(refreshableProfiles.count == 1 ? "" : "es")...")
+
+            let remainingCounts = await withCheckedContinuation { (cont: CheckedContinuation<[String: Int], Never>) in
+                ioQueue.async { [self] in
+                    let (snapshot, counts) = prunePostsIndex(for: usernames)
+                    saveIndexSnapshotAsync(snapshot)
+
+                    let postTypes: [MediaType] = [.post, .reel, .video, .profilePic]
+                    for profile in refreshableProfiles {
+                        log.info("Refreshing @\(profile.username): deleting posts, keeping stories/highlights", context: "refresh")
+                        for type in postTypes {
+                            let dir = settings.mediaDirectory(for: profile.username, type: type)
+                            try? FileManager.default.removeItem(at: dir)
+                        }
+                    }
+                    cont.resume(returning: counts)
+                }
+            }
+
+            await MainActor.run {
+                for profile in refreshableProfiles {
+                    if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
+                        profileStore.profiles[idx].totalDownloaded = remainingCounts[profile.username, default: 0]
+                        profileStore.profiles[idx].lastChecked = nil
+                    }
+                }
+                profileStore.saveAll()
+            }
+
+            for profile in refreshableProfiles {
+                clearStatus(for: profile.username)
+                checkProfile(profile, profileStore: profileStore)
             }
         }
     }
@@ -315,47 +364,6 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
     /// Refresh a profile: delete posts/reels/videos/profilePic files + index, keep stories/highlights, then re-sync.
     func refreshProfile(_ profile: Profile, profileStore: ProfileStore) {
         refreshProfiles([profile], profileStore: profileStore)
-    }
-
-    private func performRefresh(_ profile: Profile, profileStore: ProfileStore) async {
-        let username = profile.username
-        let active = activeUsernames
-        guard !active.contains(username) else { return }
-
-        log.info("Refreshing @\(username): deleting posts, keeping stories/highlights", context: "refresh")
-        setStatus(.checking, for: username)
-        setActivity("Preparing refresh for @\(username)...")
-
-        await withCheckedContinuation { (cont: CheckedContinuation<Void, Never>) in
-            ioQueue.async { [self] in
-                removePostsIndex(for: username)
-
-                let postTypes: [MediaType] = [.post, .reel, .video, .profilePic]
-                for type in postTypes {
-                    let dir = settings.mediaDirectory(for: username, type: type)
-                    try? FileManager.default.removeItem(at: dir)
-                }
-                storage.createProfileDirectories(for: username)
-                cont.resume()
-            }
-        }
-
-        let remainingCount: Int = {
-            mediaLock.lock()
-            defer { mediaLock.unlock() }
-            return downloadedMedia.filter { $0.profileUsername == username }.count
-        }()
-
-        await MainActor.run {
-            if let idx = profileStore.profiles.firstIndex(where: { $0.id == profile.id }) {
-                profileStore.profiles[idx].totalDownloaded = remainingCount
-                profileStore.profiles[idx].lastChecked = nil
-                profileStore.saveAll()
-            }
-        }
-
-        clearStatus(for: username)
-        checkProfile(profile, profileStore: profileStore)
     }
 
     private func performCheck(_ profile: Profile, profileStore: ProfileStore) async {
