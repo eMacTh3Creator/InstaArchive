@@ -253,6 +253,28 @@ def sync_profile(username):
     return jsonify({"success": True, "message": f"Sync started for @{username}"})
 
 
+@app.route("/api/refresh/<username>", methods=["POST"])
+def refresh_profile(username):
+    guard = _require_auth()
+    if guard:
+        return guard
+    username = _clean_username(username)
+    store    = _store()
+    profile  = store.get_profile(username)
+    if not profile:
+        return jsonify({"error": "Profile not found"}), 404
+    dm = _dm()
+    if username in dm.active_usernames:
+        return jsonify({"success": True, "message": f"Already syncing @{username}"})
+    started = dm.refresh_profile(profile, store)
+    if not started:
+        return jsonify({"success": True, "message": f"Already syncing @{username}"})
+    return jsonify({
+        "success": True,
+        "message": f"Refreshing @{username} — re-downloading posts while keeping stories, highlights, and profile photos",
+    })
+
+
 # ---------------------------------------------------------------------------
 # Stop / Skip API
 # ---------------------------------------------------------------------------
@@ -554,6 +576,7 @@ h1{font-size:24px;font-weight:600;margin-bottom:4px}
     </div>
     <div class="detail-actions">
       <button class="btn btn-sm btn-sync" onclick="syncDetail()">Sync Now</button>
+      <button class="btn btn-sm btn-outline" onclick="refreshDetail()">Refresh</button>
       <button class="btn btn-sm btn-danger" onclick="removeDetail()">Remove</button>
       <a id="detailIGLink" class="btn btn-sm btn-outline" target="_blank" rel="noopener">View on Instagram</a>
     </div>
@@ -571,16 +594,18 @@ async function loadProfiles(){try{const r=await fetch('/api/profiles');if(r.stat
 async function loadStatus(){try{const r=await fetch('/api/status');if(r.status===401)return;const s=await r.json();document.getElementById('statProfiles').textContent=s.totalProfiles;document.getElementById('statActive').textContent=s.activeProfiles;document.getElementById('statMedia').textContent=s.totalMediaIndexed>=1000?(s.totalMediaIndexed/1000).toFixed(1)+'K':s.totalMediaIndexed;document.getElementById('statStatus').textContent=s.isDownloading?'Downloading':'Idle';}catch{}}
 function statusBadge(p){const s=p.status||'idle';if(s.startsWith('downloading'))return`<span class="badge badge-syncing">Syncing ${s.split(':')[1]||''}%</span>`;if(s==='checking')return'<span class="badge badge-syncing">Checking</span>';return`<span class="badge ${p.isActive?'badge-active':'badge-paused'}">${p.isActive?'Active':'Paused'}</span>`;}
 function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-function renderProfiles(){const el=document.getElementById('profilesList');if(!profiles.length){el.innerHTML='<div class="empty">No profiles yet.</div>';return;}el.innerHTML=profiles.map(p=>`<div class="profile-row" onclick="showDetail('${p.username}')"><div class="avatar">${p.username[0].toUpperCase()}</div><div class="profile-info"><div class="profile-name">@${p.username}</div><div class="profile-meta">${p.totalDownloaded} items${p.displayName!==p.username?' &middot; '+esc(p.displayName):''}</div></div>${statusBadge(p)}<button class="btn btn-sm btn-sync" onclick="event.stopPropagation();syncProfile('${p.username}')">Sync</button><button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeProfile('${p.username}')">Remove</button></div>`).join('');}
+function renderProfiles(){const el=document.getElementById('profilesList');if(!profiles.length){el.innerHTML='<div class="empty">No profiles yet.</div>';return;}el.innerHTML=profiles.map(p=>`<div class="profile-row" onclick="showDetail('${p.username}')"><div class="avatar">${p.username[0].toUpperCase()}</div><div class="profile-info"><div class="profile-name">@${p.username}</div><div class="profile-meta">${p.totalDownloaded} items${p.displayName!==p.username?' &middot; '+esc(p.displayName):''}</div></div>${statusBadge(p)}<button class="btn btn-sm btn-sync" onclick="event.stopPropagation();syncProfile('${p.username}')">Sync</button><button class="btn btn-sm btn-outline" onclick="event.stopPropagation();refreshProfile('${p.username}')">Refresh</button><button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeProfile('${p.username}')">Remove</button></div>`).join('');}
 async function addProfile(e){e.preventDefault();const inp=document.getElementById('usernameInput');const u=inp.value.trim();if(!u)return;document.getElementById('addBtn').disabled=true;try{const r=await fetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});const d=await r.json();if(d.error)showToast(d.error,'error');else{showToast(d.message,'success');inp.value='';}loadProfiles();loadStatus();}catch{showToast('Failed','error');}document.getElementById('addBtn').disabled=false;}
 async function removeProfile(u){if(!confirm('Remove @'+u+'?'))return;try{await fetch('/api/profiles/'+u,{method:'DELETE'});showToast('Removed @'+u,'success');loadProfiles();loadStatus();}catch{showToast('Failed','error');}}
 async function syncProfile(u){try{const r=await fetch('/api/sync/'+u,{method:'POST'});const d=await r.json();showToast(d.message,'success');setTimeout(loadProfiles,1000);}catch{showToast('Failed','error');}}
+async function refreshProfile(u){if(!confirm('Refresh @'+u+'? This will delete and re-download posts while keeping stories, highlights, and profile photos.'))return;try{const r=await fetch('/api/refresh/'+u,{method:'POST'});const d=await r.json();showToast(d.message,'success');setTimeout(loadProfiles,1000);}catch{showToast('Failed','error');}}
 async function syncAll(){try{const r=await fetch('/api/sync/all',{method:'POST'});const d=await r.json();showToast(d.message,'success');setTimeout(loadProfiles,1000);}catch{showToast('Failed','error');}}
 function exportProfiles(){window.location.href='/api/export';}
 async function importProfiles(e){const file=e.target.files[0];if(!file)return;try{const text=await file.text();const imported=JSON.parse(text);const list=Array.isArray(imported)?imported:(imported.profiles||[]);let added=0;for(const p of list){const u=p.username||p;if(!u||typeof u!=='string')continue;try{const r=await fetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});const d=await r.json();if(d.success)added++;}catch{}}showToast('Imported '+added+' profile'+(added===1?'':'s'),'success');loadProfiles();loadStatus();}catch{showToast('Invalid file','error');}e.target.value='';}
 async function showDetail(u){currentDetail=u;try{const r=await fetch('/api/profile/'+u);const d=await r.json();if(d.error){showToast(d.error,'error');return;}document.getElementById('detailAvatar').textContent=d.username[0].toUpperCase();document.getElementById('detailName').textContent='@'+d.username;document.getElementById('detailDisplayName').textContent=d.displayName!==d.username?d.displayName:'';document.getElementById('detailBio').textContent=d.bio||'';document.getElementById('detailIGLink').href='https://www.instagram.com/'+d.username+'/';const fmtBytes=b=>{if(b>=1073741824)return(b/1073741824).toFixed(1)+' GB';if(b>=1048576)return(b/1048576).toFixed(1)+' MB';if(b>=1024)return(b/1024).toFixed(0)+' KB';return b+' B';};const fmtDate=iso=>{if(!iso)return'Never';const dt=new Date(iso);return dt.toLocaleDateString()+' '+dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});};document.getElementById('detailStats').innerHTML=[{v:d.totalIndexed,l:'Total Media'},{v:fmtBytes(d.totalFileSize),l:'Storage Used'},{v:fmtDate(d.lastChecked),l:'Last Checked'},{v:fmtDate(d.lastNewContent),l:'Last New Content'},{v:fmtDate(d.dateAdded),l:'Date Added'},{v:d.isActive?'Active':'Paused',l:'Status'}].map(s=>`<div class="stat-card"><div class="stat-val">${s.v}</div><div class="stat-label">${s.l}</div></div>`).join('');const types=d.mediaByType||{};const rows=Object.entries(types).sort((a,b)=>b[1]-a[1]);if(rows.length){document.getElementById('mediaBreakdown').style.display='block';document.getElementById('mediaRows').innerHTML=rows.map(([t,c])=>`<div class="media-row"><span>${t}</span><span class="media-count">${c}</span></div>`).join('');}else{document.getElementById('mediaBreakdown').style.display='none';}document.getElementById('listView').style.display='none';document.getElementById('detailView').className='detail-panel open';}catch{showToast('Failed to load','error');}}
 function showList(){currentDetail=null;document.getElementById('detailView').className='detail-panel';document.getElementById('listView').style.display='block';loadProfiles();}
 async function syncDetail(){if(!currentDetail)return;await syncProfile(currentDetail);setTimeout(()=>showDetail(currentDetail),1500);}
+async function refreshDetail(){if(!currentDetail)return;await refreshProfile(currentDetail);setTimeout(()=>showDetail(currentDetail),1500);}
 async function removeDetail(){if(!currentDetail)return;if(!confirm('Remove @'+currentDetail+'?'))return;try{await fetch('/api/profiles/'+currentDetail,{method:'DELETE'});showToast('Removed @'+currentDetail,'success');showList();}catch{showToast('Failed','error');}}
 function showToast(msg,type){const el=document.getElementById('toast');el.textContent=msg;el.className='toast toast-'+type;el.style.opacity='1';setTimeout(()=>{el.style.opacity='0';},2500);}
 loadProfiles();loadStatus();setInterval(()=>{loadStatus();if(!currentDetail)loadProfiles();},5000);

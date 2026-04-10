@@ -19,6 +19,7 @@ All core features from the macOS version:
 - **Password protection** — optional login for the web interface
 - **Export/Import** — save and load your profile list as JSON
 - **Per-profile stats** — media counts by type, storage usage, last checked time
+- **Profile refresh** — re-download posts while keeping stories, highlights, and profile pictures
 
 ### Desktop UI mode (new)
 - **Native dark-themed window** — sidebar with profile management, stat cards, media grid

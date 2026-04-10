@@ -3,6 +3,7 @@ download_manager.py — Orchestrates concurrent profile downloads with stop/skip
 Mirrors the macOS DownloadManager.swift logic using Python threading.
 """
 import threading
+import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -137,6 +138,18 @@ class DownloadManager:
             self._downloaded_ids = {i.instagram_id for i in self._media_items}
             self._storage.save_media_index(self._media_items)
 
+    def remove_posts_index(self, username: str) -> int:
+        keep_types = {"Stories", "Highlights", "Profile Pictures"}
+        with self._media_lock:
+            self._media_items = [
+                item for item in self._media_items
+                if item.profile_username != username or item.media_type in keep_types
+            ]
+            self._downloaded_ids = {i.instagram_id for i in self._media_items}
+            remaining = sum(1 for item in self._media_items if item.profile_username == username)
+            self._storage.save_media_index(self._media_items)
+        return remaining
+
     def media_items_for(self, username: str) -> list[MediaItem]:
         with self._media_lock:
             return [i for i in self._media_items if i.profile_username == username]
@@ -214,6 +227,75 @@ class DownloadManager:
             name=f"download-{username}",
         )
         t.start()
+
+    def refresh_profile(self, profile: dict, profile_store=None) -> bool:
+        """Delete posts/reels/videos, keep stories/highlights/profile pictures, then sync."""
+        username = profile["username"]
+        with self._state_lock:
+            if username in self.active_usernames:
+                return False
+            stop_flag = threading.Event()
+            self._profile_stop_flags[username] = stop_flag
+            self.active_usernames.add(username)
+            self.is_running = True
+
+        t = threading.Thread(
+            target=self._perform_refresh,
+            args=(profile, profile_store, stop_flag),
+            daemon=True,
+            name=f"refresh-{username}",
+        )
+        t.start()
+        return True
+
+    def _perform_refresh(self, profile: dict, profile_store, stop_flag: threading.Event):
+        username = profile["username"]
+        try:
+            self._log.info(
+                f"Refreshing @{username}: deleting posts, keeping stories/highlights/profile pictures",
+                context="refresh",
+            )
+            self._set_status(username, ProfileStatus(kind=StatusKind.CHECKING))
+            self.current_activity = f"Preparing refresh for @{username}..."
+
+            if stop_flag.is_set() or self._stop_all_flag.is_set():
+                raise InterruptedError()
+
+            remaining = self.remove_posts_index(username)
+
+            for media_type in ("Posts", "Reels", "Videos"):
+                shutil.rmtree(self._storage.media_dir(username, media_type), ignore_errors=True)
+
+            if profile_store is not None:
+                profile_store.reset_after_refresh(username, remaining)
+                updated_profile = profile_store.get_profile(username) or profile
+            else:
+                updated_profile = profile
+
+            if stop_flag.is_set() or self._stop_all_flag.is_set():
+                raise InterruptedError()
+
+            self._perform_check(updated_profile, profile_store, stop_flag)
+        except InterruptedError:
+            self._save_index()
+            self._log.info(f"@{username}: refresh skipped/cancelled", context="refresh")
+            self._set_status(username, ProfileStatus(kind=StatusKind.SKIPPED))
+            with self._state_lock:
+                self.active_usernames.discard(username)
+                self._profile_stop_flags.pop(username, None)
+                if not self.active_usernames:
+                    self.is_running = False
+                    self.current_activity = ""
+        except Exception as e:
+            self._save_index()
+            self._log.error(f"@{username}: refresh failed — {e}", context="refresh")
+            self._set_status(username, ProfileStatus(kind=StatusKind.ERROR, error_msg=str(e)))
+            with self._state_lock:
+                self.active_usernames.discard(username)
+                self._profile_stop_flags.pop(username, None)
+                if not self.active_usernames:
+                    self.is_running = False
+                    self.current_activity = ""
 
     def _perform_check(self, profile: dict, profile_store, stop_flag: threading.Event):
         username = profile["username"]

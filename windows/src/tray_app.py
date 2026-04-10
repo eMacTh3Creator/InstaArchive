@@ -4,6 +4,7 @@ Right-click menu: Open Dashboard, Check All, Stop, Settings, Quit.
 """
 import threading
 import webbrowser
+from pathlib import Path
 from typing import Optional
 
 from app_settings import AppSettings
@@ -13,6 +14,9 @@ def _create_icon_image():
     """Generate a simple camera-like icon using Pillow."""
     try:
         from PIL import Image, ImageDraw
+        icon_path = Path(__file__).resolve().parent.parent / "assets" / "icon.ico"
+        if icon_path.exists():
+            return Image.open(icon_path)
         size = 64
         img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)

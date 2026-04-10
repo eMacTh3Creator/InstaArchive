@@ -194,7 +194,7 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         saveIndexSnapshotAsync(snapshot)
     }
 
-    /// Remove media index entries for a profile, but keep stories and highlights
+    /// Remove media index entries for a profile, but keep stories, highlights, and profile pictures.
     func removePostsIndex(for username: String) {
         let (snapshot, _) = prunePostsIndex(for: [username])
         saveIndexSnapshotAsync(snapshot)
@@ -205,7 +205,8 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         downloadedMedia.removeAll {
             usernames.contains($0.profileUsername) &&
             $0.mediaType != .story &&
-            $0.mediaType != .highlight
+            $0.mediaType != .highlight &&
+            $0.mediaType != .profilePic
         }
         rebuildIdIndex()
         let snapshot = downloadedMedia
@@ -332,9 +333,9 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                     let (snapshot, counts) = prunePostsIndex(for: usernames)
                     saveIndexSnapshotAsync(snapshot)
 
-                    let postTypes: [MediaType] = [.post, .reel, .video, .profilePic]
+                    let postTypes: [MediaType] = [.post, .reel, .video]
                     for profile in refreshableProfiles {
-                        log.info("Refreshing @\(profile.username): deleting posts, keeping stories/highlights", context: "refresh")
+                        log.info("Refreshing @\(profile.username): deleting posts, keeping stories/highlights/profile pictures", context: "refresh")
                         for type in postTypes {
                             let dir = settings.mediaDirectory(for: profile.username, type: type)
                             try? FileManager.default.removeItem(at: dir)
@@ -361,7 +362,7 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Refresh a profile: delete posts/reels/videos/profilePic files + index, keep stories/highlights, then re-sync.
+    /// Refresh a profile: delete posts/reels/videos files + index, keep stories/highlights/profile pictures, then re-sync.
     func refreshProfile(_ profile: Profile, profileStore: ProfileStore) {
         refreshProfiles([profile], profileStore: profileStore)
     }

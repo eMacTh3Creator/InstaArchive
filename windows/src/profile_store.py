@@ -108,6 +108,15 @@ class ProfileStore:
                     break
         self._save()
 
+    def reset_after_refresh(self, username: str, remaining_items: int):
+        with self._plock:
+            for p in self._profiles:
+                if p["username"] == username:
+                    p["total_downloaded"] = remaining_items
+                    p["last_checked"] = None
+                    break
+        self._save()
+
     def set_active(self, username: str, active: bool):
         with self._plock:
             for p in self._profiles:

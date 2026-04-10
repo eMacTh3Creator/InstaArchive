@@ -263,7 +263,7 @@ struct ProfileDetailView: View {
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .help("Re-download all posts (keeps stories)")
+                    .help("Re-download posts while keeping stories, highlights, and profile photos")
 
                     Button(action: openInFinder) {
                         Image(systemName: "folder")

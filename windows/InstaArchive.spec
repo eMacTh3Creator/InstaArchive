@@ -13,7 +13,9 @@ a = Analysis(
     ['src/main.py'],
     pathex=['src'],
     binaries=[],
-    datas=[],
+    datas=[
+        ('assets/icon.ico', 'assets'),
+    ],
     hiddenimports=[
         'pystray._win32',
         'PIL._tkinter_finder',

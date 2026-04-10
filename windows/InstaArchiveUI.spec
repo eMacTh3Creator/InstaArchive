@@ -26,6 +26,7 @@ a = Analysis(
         ('src/web_server.py', 'src'),
         ('src/logger.py', 'src'),
         ('src/tray_app.py', 'src'),
+        ('assets/icon.ico', 'assets'),
     ],
     hiddenimports=[
         # PyQt6

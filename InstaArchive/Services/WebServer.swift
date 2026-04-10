@@ -516,7 +516,7 @@ class WebServer: ObservableObject {
         }
 
         DownloadManager.shared.refreshProfile(profile, profileStore: store)
-        self.sendJSON(connection: connection, json: ["success": true, "message": "Refreshing @\(clean) — re-downloading all posts"])
+        self.sendJSON(connection: connection, json: ["success": true, "message": "Refreshing @\(clean) — re-downloading posts while keeping stories, highlights, and profile photos"])
     }
 
     // MARK: - HTML Pages
@@ -869,7 +869,7 @@ class WebServer: ObservableObject {
     }
 
     async function refreshProfile(username) {
-      if (!confirm('Refresh @' + username + '? This will delete and re-download all posts (stories are kept).')) return;
+      if (!confirm('Refresh @' + username + '? This will delete and re-download posts while keeping stories, highlights, and profile photos.')) return;
       try {
         const res = await fetch('/api/refresh/' + username, { method: 'POST' });
         const data = await res.json();
@@ -989,7 +989,7 @@ class WebServer: ObservableObject {
 
     async function refreshDetail() {
       if (!currentDetail) return;
-      if (!confirm('Refresh @' + currentDetail + '? This will delete and re-download all posts (stories are kept).')) return;
+      if (!confirm('Refresh @' + currentDetail + '? This will delete and re-download posts while keeping stories, highlights, and profile photos.')) return;
       await refreshProfile(currentDetail);
       setTimeout(() => showDetail(currentDetail), 1500);
     }

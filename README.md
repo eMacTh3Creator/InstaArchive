@@ -30,7 +30,7 @@ Both versions share the same core feature set:
 - **Export/Import** — save and load your profile list as JSON
 - **Per-profile stats** — media counts by type, storage usage, last checked time
 - **Sync controls** — trigger sync for one profile or all at once
-- **Profile refresh** — re-download full posts while keeping time-sensitive stories/highlights
+- **Profile refresh** — re-download posts while keeping time-sensitive stories, highlights, and profile pictures
 
 ---
 

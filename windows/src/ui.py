@@ -41,6 +41,8 @@ APPDATA_DIR = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"
 COOKIES_PATH = APPDATA_DIR / "cookies.json"
 PICTURES_DIR = Path(os.environ.get("USERPROFILE", Path.home())) / "Pictures" / "InstaArchive"
 MEDIA_TYPES = ["Posts", "Reels", "Videos", "Highlights", "Stories", "Profile Pictures"]
+APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+WINDOWS_ICON_PATH = APP_ROOT / "assets" / "icon.ico"
 
 # ---------------------------------------------------------------------------
 # Theme constants
@@ -333,6 +335,8 @@ class Worker(QThread):
                 self.profile_done.emit(_req.get(f"{API}/api/profile/{self.arg}", timeout=5).json())
             elif self.action == "sync":
                 _req.post(f"{API}/api/sync/{self.arg}", timeout=5)
+            elif self.action == "refresh":
+                _req.post(f"{API}/api/refresh/{self.arg}", timeout=5)
             elif self.action == "sync_all":
                 _req.post(f"{API}/api/sync/all", timeout=5)
             elif self.action == "add":
@@ -358,6 +362,7 @@ class Worker(QThread):
 class ProfileRow(QFrame):
     clicked    = pyqtSignal(str)
     sync_req   = pyqtSignal(str)
+    refresh_req = pyqtSignal(str)
     remove_req = pyqtSignal(str)
 
     def __init__(self, p: dict, parent=None):
@@ -409,11 +414,15 @@ class ProfileRow(QFrame):
         bs.setObjectName("sync")
         bs.setFixedSize(60, 30)
         bs.clicked.connect(lambda: self.sync_req.emit(self.username))
+        brf = QPushButton("Refresh")
+        brf.setFixedSize(74, 30)
+        brf.clicked.connect(lambda: self.refresh_req.emit(self.username))
         br = QPushButton("Remove")
         br.setObjectName("danger")
         br.setFixedSize(72, 30)
         br.clicked.connect(lambda: self.remove_req.emit(self.username))
         lay.addWidget(bs)
+        lay.addWidget(brf)
         lay.addWidget(br)
 
     def mousePressEvent(self, e):
@@ -427,6 +436,7 @@ class ProfileRow(QFrame):
 class DetailPanel(QWidget):
     back       = pyqtSignal()
     sync_req   = pyqtSignal(str)
+    refresh_req = pyqtSignal(str)
     remove_req = pyqtSignal(str)
 
     def __init__(self, parent=None):
@@ -476,15 +486,19 @@ class DetailPanel(QWidget):
         self._sync_btn = QPushButton("Sync Now")
         self._sync_btn.setObjectName("sync")
         self._sync_btn.setFixedHeight(34)
+        self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setFixedHeight(34)
         self._remove_btn = QPushButton("Remove Profile")
         self._remove_btn.setObjectName("danger")
         self._remove_btn.setFixedHeight(34)
         open_btn = QPushButton("Open Folder")
         open_btn.setFixedHeight(34)
         self._sync_btn.clicked.connect(lambda: self.sync_req.emit(self._username))
+        self._refresh_btn.clicked.connect(lambda: self.refresh_req.emit(self._username))
         self._remove_btn.clicked.connect(lambda: self.remove_req.emit(self._username))
         open_btn.clicked.connect(self._open_folder)
         acts.addWidget(self._sync_btn)
+        acts.addWidget(self._refresh_btn)
         acts.addWidget(self._remove_btn)
         acts.addWidget(open_btn)
         acts.addStretch()
@@ -786,6 +800,8 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("InstaArchive")
+        if WINDOWS_ICON_PATH.exists():
+            self.setWindowIcon(QIcon(str(WINDOWS_ICON_PATH)))
         self.resize(1100, 700)
         self.setMinimumSize(900, 560)
         self._workers: list[Worker] = []
@@ -939,6 +955,7 @@ class MainWindow(QMainWindow):
         self._detail = DetailPanel()
         self._detail.back.connect(self._show_list)
         self._detail.sync_req.connect(self._sync_profile)
+        self._detail.refresh_req.connect(self._refresh_profile)
         self._detail.remove_req.connect(self._remove_profile)
         ds.setWidget(self._detail)
         self._stack.addWidget(ds)
@@ -1004,6 +1021,7 @@ class MainWindow(QMainWindow):
             row = ProfileRow(p)
             row.clicked.connect(self._show_detail)
             row.sync_req.connect(self._sync_profile)
+            row.refresh_req.connect(self._refresh_profile)
             row.remove_req.connect(self._remove_profile)
             self._list_lay.insertWidget(self._list_lay.count() - 1, row)
 
@@ -1050,6 +1068,18 @@ class MainWindow(QMainWindow):
         self._run("sync", u)
         QTimer.singleShot(1000, self._refresh)
 
+    def _refresh_profile(self, u: str):
+        reply = QMessageBox.question(
+            self,
+            "Refresh Profile",
+            f"Refresh @{u}?\n\nThis will delete and re-download posts while keeping stories, highlights, and profile photos.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._run("refresh", u)
+        QTimer.singleShot(1000, self._refresh)
+
     def _sync_all(self):
         self._run("sync_all")
         QTimer.singleShot(1000, self._refresh)
@@ -1084,6 +1114,8 @@ class MainWindow(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    if WINDOWS_ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(WINDOWS_ICON_PATH)))
     app.setStyle("Fusion")
     app.setStyleSheet(STYLESHEET)
     pal = QPalette()
