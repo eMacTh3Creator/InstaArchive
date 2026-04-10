@@ -58,7 +58,7 @@ class DownloadManager: ObservableObject {
     // but always publish immediately for final states.
     private var _uiDirty = false
     private var _publishTimer: Timer?
-    private let _publishInterval: TimeInterval = 0.3
+    private let _publishInterval: TimeInterval = 0.5
 
     private let instagram = InstagramService.shared
     private let storage = StorageManager.shared

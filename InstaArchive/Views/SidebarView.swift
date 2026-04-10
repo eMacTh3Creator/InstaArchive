@@ -188,22 +188,25 @@ struct SidebarView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(sortedProfiles) { profile in
+                            // Extract status HERE so ProfileRowView gets a plain value.
+                            // SwiftUI only re-renders rows whose value actually changed.
+                            let status = downloadManager.profileStatuses[profile.username] ?? .idle
                             ProfileRowView(
                                 profile: profile,
+                                status: status,
                                 isSelected: selectedProfile?.id == profile.id,
-                                isMultiSelected: selectedProfileIds.contains(profile.id)
+                                isMultiSelected: selectedProfileIds.contains(profile.id),
+                                onSkip: { downloadManager.skipProfile(profile.username) }
                             )
                             .contentShape(Rectangle())
                             .onTapGesture {
                                 if NSEvent.modifierFlags.contains(.command) {
-                                    // Cmd+click toggles multi-select
                                     if selectedProfileIds.contains(profile.id) {
                                         selectedProfileIds.remove(profile.id)
                                     } else {
                                         selectedProfileIds.insert(profile.id)
                                     }
                                 } else if NSEvent.modifierFlags.contains(.shift), let current = selectedProfile {
-                                    // Shift+click selects range
                                     let list = sortedProfiles
                                     if let startIdx = list.firstIndex(where: { $0.id == current.id }),
                                        let endIdx = list.firstIndex(where: { $0.id == profile.id }) {
@@ -213,7 +216,6 @@ struct SidebarView: View {
                                         }
                                     }
                                 } else {
-                                    // Normal click — single select
                                     selectedProfile = profile
                                     selectedProfileIds.removeAll()
                                 }
@@ -327,15 +329,17 @@ struct SidebarView: View {
     }
 }
 
-/// A single profile row in the sidebar
+/// A single profile row — takes status as a VALUE parameter, not EnvironmentObject.
+/// This means SwiftUI only re-renders this row when ITS status changes,
+/// not when ANY download state changes (which was causing 180 row re-renders).
 struct ProfileRowView: View {
     let profile: Profile
+    let status: DownloadStatus
     let isSelected: Bool
     let isMultiSelected: Bool
-    @EnvironmentObject var downloadManager: DownloadManager
+    let onSkip: () -> Void
 
     private var isActive: Bool {
-        let status = downloadManager.profileStatuses[profile.username] ?? .idle
         if case .checking = status { return true }
         if case .downloading = status { return true }
         return false
@@ -343,7 +347,7 @@ struct ProfileRowView: View {
 
     var statusIcon: some View {
         Group {
-            switch downloadManager.profileStatuses[profile.username] ?? .idle {
+            switch status {
             case .idle:
                 Circle()
                     .fill(profile.isActive ? Color.green : Color.gray)
@@ -410,7 +414,7 @@ struct ProfileRowView: View {
             Spacer()
 
             if isActive {
-                Button(action: { downloadManager.skipProfile(profile.username) }) {
+                Button(action: onSkip) {
                     Image(systemName: "forward.fill")
                         .font(.system(size: 9))
                         .foregroundColor(.secondary)

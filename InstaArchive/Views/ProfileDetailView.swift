@@ -8,22 +8,28 @@ struct ProfileDetailView: View {
     @State private var selectedMediaType: MediaType? = nil
     @State private var showingDeleteConfirmation = false
     @State private var cachedItems: [MediaItem] = []
-    @State private var lastRefreshId: String = ""
     @State private var profileStorageSize: Int64 = 0
+    @State private var showMedia = false
+    @State private var isLoadingMedia = false
+    @State private var loadTask: Task<Void, Never>?
+    @State private var loadedForUsername: String = ""
     var onDelete: (() -> Void)? = nil
 
-    /// Single query, cached in @State so SwiftUI doesn't re-filter 20K items on every body eval.
-    /// Uses async variant to avoid blocking the main thread for large indexes.
-    private func refreshItemsIfNeeded() {
-        let refreshId = "\(profile.username)-\(downloadManager.totalDownloaded)"
-        guard refreshId != lastRefreshId else { return }
-        lastRefreshId = refreshId
+    /// Load media on demand — only when user taps "Show Media".
+    /// Cancels any in-flight load to prevent stale data from a previous profile.
+    private func loadMedia() {
+        // Cancel any previous load
+        loadTask?.cancel()
+        isLoadingMedia = true
         let username = profile.username
-        Task {
+        loadedForUsername = username
+
+        loadTask = Task {
             let items = await downloadManager.mediaItemsAsync(for: username)
+            guard !Task.isCancelled, loadedForUsername == username else { return }
             cachedItems = items
+            isLoadingMedia = false
         }
-        calculateStorageSize()
     }
 
     private func calculateStorageSize() {
@@ -84,24 +90,84 @@ struct ProfileDetailView: View {
 
             Divider()
 
-            // Filter bar
-            filterBar
+            if showMedia {
+                // Filter bar
+                filterBar
+                Divider()
 
-            Divider()
-
-            // Media grid
-            if filteredItems.isEmpty {
-                emptyMediaView
+                // Media grid
+                if isLoadingMedia {
+                    VStack(spacing: 12) {
+                        Spacer()
+                        ProgressView()
+                            .controlSize(.regular)
+                        Text("Loading media...")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .frame(maxWidth: .infinity)
+                } else if filteredItems.isEmpty {
+                    emptyMediaView
+                } else {
+                    mediaGrid
+                }
             } else {
-                mediaGrid
+                // Lightweight landing — no media loaded
+                profileLanding
             }
         }
-        .onAppear { refreshItemsIfNeeded() }
+        .onAppear { calculateStorageSize() }
         .onChange(of: profile.username) { _ in
-            lastRefreshId = ""
-            refreshItemsIfNeeded()
+            // Reset when switching profiles — don't auto-load media
+            loadTask?.cancel()
+            cachedItems = []
+            showMedia = false
+            isLoadingMedia = false
+            selectedMediaType = nil
+            profileStorageSize = 0
+            calculateStorageSize()
         }
-        .onChange(of: downloadManager.totalDownloaded) { _ in refreshItemsIfNeeded() }
+    }
+
+    // MARK: - Profile Landing (no media loaded)
+
+    private var profileLanding: some View {
+        VStack(spacing: 16) {
+            Spacer()
+
+            Image(systemName: "photo.on.rectangle.angled")
+                .font(.system(size: 44, weight: .thin))
+                .foregroundColor(.secondary)
+
+            VStack(spacing: 4) {
+                Text("\(profile.totalDownloaded) items archived")
+                    .font(.headline)
+                if profileStorageSize > 0 {
+                    Text(StorageManager.formatBytes(profileStorageSize))
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            Button(action: {
+                showMedia = true
+                loadMedia()
+            }) {
+                Label("Show Media", systemImage: "square.grid.2x2")
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.regular)
+
+            if profile.totalDownloaded == 0 && !isDownloadingThisProfile {
+                Button("Check Now", action: checkNow)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
     }
 
     // MARK: - Profile Header
@@ -273,6 +339,22 @@ struct ProfileDetailView: View {
                         selectedMediaType = (selectedMediaType == type) ? nil : type
                     }
                 }
+
+                Spacer()
+
+                // Hide media button
+                Button(action: {
+                    loadTask?.cancel()
+                    cachedItems = []
+                    showMedia = false
+                    selectedMediaType = nil
+                }) {
+                    Image(systemName: "xmark.circle")
+                        .font(.system(size: 12))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Hide media grid")
             }
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
