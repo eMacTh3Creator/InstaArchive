@@ -3,7 +3,6 @@ import SwiftUI
 /// Detail view showing a profile's archive status and downloaded media
 struct ProfileDetailView: View {
     @Binding var profile: Profile
-    @EnvironmentObject var downloadManager: DownloadManager
     @EnvironmentObject var profileStore: ProfileStore
     @State private var selectedMediaType: MediaType? = nil
     @State private var showingDeleteConfirmation = false
@@ -13,6 +12,8 @@ struct ProfileDetailView: View {
     @State private var isLoadingMedia = false
     @State private var loadTask: Task<Void, Never>?
     @State private var loadedForUsername: String = ""
+    @State private var currentStatus: DownloadStatus = .idle
+    @State private var statusTimer: Timer?
     var onDelete: (() -> Void)? = nil
 
     /// Load media on demand — only when user taps "Show Media".
@@ -25,7 +26,7 @@ struct ProfileDetailView: View {
         loadedForUsername = username
 
         loadTask = Task {
-            let items = await downloadManager.mediaItemsAsync(for: username)
+            let items = await DownloadManager.shared.mediaItemsAsync(for: username)
             guard !Task.isCancelled, loadedForUsername == username else { return }
             cachedItems = items
             isLoadingMedia = false
@@ -60,7 +61,7 @@ struct ProfileDetailView: View {
             profileHeader
 
             // Error banner (if last check failed)
-            if case .error(let message) = downloadManager.profileStatuses[profile.username] ?? .idle {
+            if case .error(let message) = currentStatus {
                 HStack(spacing: 8) {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundColor(.orange)
@@ -74,7 +75,7 @@ struct ProfileDetailView: View {
                     Button("Retry") { checkNow() }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.mini)
-                    Button(action: { downloadManager.clearStatus(for: profile.username) }) {
+                    Button(action: { DownloadManager.shared.clearStatus(for: profile.username) }) {
                         Image(systemName: "xmark")
                             .font(.system(size: 9, weight: .bold))
                             .foregroundColor(.secondary)
@@ -117,7 +118,11 @@ struct ProfileDetailView: View {
                 profileLanding
             }
         }
-        .onAppear { calculateStorageSize() }
+        .onAppear {
+            calculateStorageSize()
+            startStatusPolling()
+        }
+        .onDisappear { stopStatusPolling() }
         .onChange(of: profile.username) { _ in
             // Reset when switching profiles — don't auto-load media
             loadTask?.cancel()
@@ -127,6 +132,7 @@ struct ProfileDetailView: View {
             selectedMediaType = nil
             profileStorageSize = 0
             calculateStorageSize()
+            refreshStatus()
         }
     }
 
@@ -399,6 +405,30 @@ struct ProfileDetailView: View {
         .frame(maxWidth: .infinity)
     }
 
+    // MARK: - Status Polling
+
+    private func startStatusPolling() {
+        refreshStatus()
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { _ in
+            Task { @MainActor in refreshStatus() }
+        }
+        if let timer = statusTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopStatusPolling() {
+        statusTimer?.invalidate()
+        statusTimer = nil
+    }
+
+    private func refreshStatus() {
+        let newStatus = DownloadManager.shared.profileStatuses[profile.username] ?? .idle
+        if newStatus != currentStatus {
+            currentStatus = newStatus
+        }
+    }
+
     // MARK: - Actions
 
     private var scheduleLabel: String {
@@ -417,18 +447,18 @@ struct ProfileDetailView: View {
     }
 
     private var isDownloadingThisProfile: Bool {
-        let status = downloadManager.profileStatuses[profile.username] ?? .idle
+        let status = currentStatus
         if case .checking = status { return true }
         if case .downloading = status { return true }
         return false
     }
 
     private func checkNow() {
-        downloadManager.checkProfile(profile, profileStore: profileStore)
+        DownloadManager.shared.checkProfile(profile, profileStore: profileStore)
     }
 
     private func skipThisProfile() {
-        downloadManager.skipProfile(profile.username)
+        DownloadManager.shared.skipProfile(profile.username)
     }
 
     private func openInFinder() {

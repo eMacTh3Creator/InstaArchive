@@ -9,7 +9,9 @@ enum ProfileSortOption: String, CaseIterable {
     case itemCount = "Item Count"
 }
 
-/// Sidebar listing all tracked profiles with multi-select, sort, and context menus
+/// Sidebar listing all tracked profiles with multi-select, sort, and context menus.
+/// Does NOT observe DownloadManager — uses a polling timer for status updates
+/// to avoid triggering 180-row re-renders on every state change.
 struct SidebarView: View {
     let profiles: [Profile]
     @Binding var selectedProfile: Profile?
@@ -24,8 +26,11 @@ struct SidebarView: View {
     let onDeleteSelected: (Set<UUID>) -> Void
     let onSetSchedule: (Set<UUID>, Int?) -> Void
 
-    @EnvironmentObject var downloadManager: DownloadManager
     @EnvironmentObject var profileStore: ProfileStore
+
+    // Polled status snapshot — updated every 2 seconds, NOT driven by objectWillChange
+    @State private var statuses: [String: DownloadStatus] = [:]
+    @State private var pollTimer: Timer?
 
     private var sortedProfiles: [Profile] {
         let sorted: [Profile]
@@ -188,15 +193,13 @@ struct SidebarView: View {
                 ScrollView {
                     LazyVStack(spacing: 0) {
                         ForEach(sortedProfiles) { profile in
-                            // Extract status HERE so ProfileRowView gets a plain value.
-                            // SwiftUI only re-renders rows whose value actually changed.
-                            let status = downloadManager.profileStatuses[profile.username] ?? .idle
+                            let status = statuses[profile.username] ?? .idle
                             ProfileRowView(
                                 profile: profile,
                                 status: status,
                                 isSelected: selectedProfile?.id == profile.id,
                                 isMultiSelected: selectedProfileIds.contains(profile.id),
-                                onSkip: { downloadManager.skipProfile(profile.username) }
+                                onSkip: { DownloadManager.shared.skipProfile(profile.username) }
                             )
                             .contentShape(Rectangle())
                             .onTapGesture {
@@ -231,11 +234,37 @@ struct SidebarView: View {
 
             Divider()
 
-            // Bottom bar — separate view with its own polling timer
+            // Bottom bar — lightweight, polls on its own timer
             SidebarBottomBar(
                 profileCount: profiles.count,
                 onCheckAll: onCheckAll
             )
+        }
+        .onAppear { startPolling() }
+        .onDisappear { stopPolling() }
+    }
+
+    // MARK: - Status Polling
+
+    private func startPolling() {
+        refreshStatuses()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            Task { @MainActor in refreshStatuses() }
+        }
+        if let timer = pollTimer {
+            RunLoop.main.add(timer, forMode: .common)
+        }
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+    }
+
+    private func refreshStatuses() {
+        let newStatuses = DownloadManager.shared.profileStatuses
+        if newStatuses != statuses {
+            statuses = newStatuses
         }
     }
 
@@ -291,9 +320,7 @@ struct SidebarView: View {
     }
 }
 
-/// A single profile row — takes status as a VALUE parameter, not EnvironmentObject.
-/// This means SwiftUI only re-renders this row when ITS status changes,
-/// not when ANY download state changes (which was causing 180 row re-renders).
+/// A single profile row — pure value parameters, no observation.
 struct ProfileRowView: View {
     let profile: Profile
     let status: DownloadStatus
@@ -340,14 +367,12 @@ struct ProfileRowView: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            // Multi-select indicator
             if isMultiSelected {
                 Image(systemName: "checkmark.circle.fill")
                     .font(.system(size: 12))
                     .foregroundColor(.accentColor)
             }
 
-            // Profile pic placeholder
             ZStack {
                 Circle()
                     .fill(Color.accentColor.opacity(0.15))
@@ -400,19 +425,19 @@ struct ProfileRowView: View {
     }
 }
 
-/// Bottom bar that polls DownloadManager.currentActivity on its own timer.
-/// This avoids triggering objectWillChange → full sidebar re-render for activity text updates.
+/// Bottom bar — polls DownloadManager on its own timer, independent of view hierarchy.
 struct SidebarBottomBar: View {
     let profileCount: Int
     let onCheckAll: () -> Void
 
-    @EnvironmentObject var downloadManager: DownloadManager
+    @State private var isRunning = false
     @State private var activityText: String = ""
+    @State private var activeCount: Int = 0
     @State private var pollTimer: Timer?
 
     var body: some View {
         HStack {
-            if downloadManager.isRunning {
+            if isRunning {
                 ProgressView()
                     .controlSize(.small)
                     .scaleEffect(0.7)
@@ -422,8 +447,8 @@ struct SidebarBottomBar: View {
                         .foregroundColor(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    if downloadManager.activeUsernames.count > 1 {
-                        Text("\(downloadManager.activeUsernames.count) profiles active")
+                    if activeCount > 1 {
+                        Text("\(activeCount) profiles active")
                             .font(.system(size: 9))
                             .foregroundColor(.secondary.opacity(0.7))
                     }
@@ -434,8 +459,8 @@ struct SidebarBottomBar: View {
                     .foregroundColor(.secondary)
             }
             Spacer()
-            if downloadManager.isRunning {
-                Button(action: { downloadManager.stopAll() }) {
+            if isRunning {
+                Button(action: { DownloadManager.shared.stopAll() }) {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 10))
                         .foregroundColor(.red)
@@ -448,25 +473,19 @@ struct SidebarBottomBar: View {
                     .font(.system(size: 11))
             }
             .buttonStyle(.plain)
-            .disabled(downloadManager.isRunning)
+            .disabled(isRunning)
             .help("Check All Profiles")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
         .onAppear { startPolling() }
         .onDisappear { stopPolling() }
-        .onChange(of: downloadManager.isRunning) { running in
-            if running { startPolling() } else { stopPolling(); activityText = "" }
-        }
     }
 
     private func startPolling() {
-        stopPolling()
-        activityText = downloadManager.currentActivity
+        refresh()
         pollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            Task { @MainActor in
-                activityText = downloadManager.currentActivity
-            }
+            Task { @MainActor in refresh() }
         }
         if let timer = pollTimer {
             RunLoop.main.add(timer, forMode: .common)
@@ -476,6 +495,13 @@ struct SidebarBottomBar: View {
     private func stopPolling() {
         pollTimer?.invalidate()
         pollTimer = nil
+    }
+
+    private func refresh() {
+        let dm = DownloadManager.shared
+        isRunning = dm.isRunning
+        activityText = dm.currentActivity
+        activeCount = dm.activeUsernames.count
     }
 }
 

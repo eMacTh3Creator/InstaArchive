@@ -3,7 +3,7 @@ import SwiftUI
 /// Main content view with sidebar navigation and detail panel
 struct ContentView: View {
     @EnvironmentObject var profileStore: ProfileStore
-    @EnvironmentObject var downloadManager: DownloadManager
+    // NOTE: Do NOT observe DownloadManager here — use .shared for actions.
     @State private var selectedProfile: Profile?
     @State private var selectedProfileIds: Set<UUID> = []
     @State private var showingAddProfile = false
@@ -60,7 +60,7 @@ struct ContentView: View {
                 profileStore.addProfile(profile)
                 selectedProfile = profile
                 if startSync {
-                    downloadManager.checkProfile(profile, profileStore: profileStore)
+                    DownloadManager.shared.checkProfile(profile, profileStore: profileStore)
                 }
             }
         }
@@ -106,12 +106,12 @@ struct ContentView: View {
     // MARK: - Actions
 
     private func checkAll() {
-        downloadManager.checkAllProfiles(profileStore: profileStore)
+        DownloadManager.shared.checkAllProfiles(profileStore: profileStore)
     }
 
     private func syncSelected(_ ids: Set<UUID>) {
         let profiles = profileStore.profiles.filter { ids.contains($0.id) }
-        downloadManager.checkProfiles(profiles, profileStore: profileStore)
+        DownloadManager.shared.checkProfiles(profiles, profileStore: profileStore)
     }
 
     private func setSchedule(_ ids: Set<UUID>, _ hours: Int?) {
@@ -151,11 +151,11 @@ struct ContentView: View {
 /// Home view with app stats
 struct HomeView: View {
     @EnvironmentObject var profileStore: ProfileStore
-    @EnvironmentObject var downloadManager: DownloadManager
     @EnvironmentObject var webServer: WebServer
     @ObservedObject private var settings = AppSettings.shared
     @State private var showingLogin = false
     @State private var totalStorage: Int64 = 0
+    @State private var totalMedia: Int = 0
 
     private var activeCount: Int {
         profileStore.profiles.filter { $0.isActive }.count
@@ -225,7 +225,7 @@ struct HomeView: View {
 
                     StatBox(
                         icon: "photo.on.rectangle",
-                        value: formattedCount(downloadManager.totalDownloaded),
+                        value: formattedCount(totalMedia),
                         label: "Media Indexed"
                     )
 
@@ -266,9 +266,9 @@ struct HomeView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onAppear { calculateStorage() }
-        .onChange(of: downloadManager.isRunning) { running in
-            if !running { calculateStorage() }
+        .onAppear {
+            calculateStorage()
+            totalMedia = DownloadManager.shared.totalDownloaded
         }
         .sheet(isPresented: $showingLogin) {
             InstagramLoginView()
