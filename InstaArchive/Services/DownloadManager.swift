@@ -538,6 +538,10 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                             let data = try await self.instagram.downloadMediaData(from: job.url)
                             try self.storage.saveFile(data: data, to: job.savePath)
 
+                            if data.count < 102400 {
+                                self.log.warn("Small file: \(job.itemId) = \(data.count) bytes, URL: \(String(job.url.prefix(100)))", context: "download")
+                            }
+
                             let mediaItem = MediaItem(
                                 profileUsername: username,
                                 mediaType: job.media.mediaType,

@@ -66,9 +66,17 @@ class InstagramService {
     /// Instagram returns candidates in arbitrary order — sorting by width descending
     /// ensures we always get the full-res image, not a thumbnail.
     private func bestImageURL(from candidates: [[String: Any]]) -> String? {
-        return candidates
-            .sorted { candidateScore($0) > candidateScore($1) }
-            .first?["url"] as? String
+        let sorted = candidates.sorted { candidateScore($0) > candidateScore($1) }
+        if let best = sorted.first, let url = best["url"] as? String {
+            let w = numericValue(best["width"])
+            let h = numericValue(best["height"])
+            let smallest = sorted.last.flatMap { numericValue($0["width"]) } ?? 0
+            if w < 500 {
+                log.warn("bestImageURL: picked \(w)x\(h) — only \(candidates.count) candidates, smallest=\(smallest)px. URL prefix: \(String(url.prefix(80)))", context: "resolution")
+            }
+            return url
+        }
+        return nil
     }
 
     private func numericValue(_ value: Any?) -> Int {
@@ -116,16 +124,19 @@ class InstagramService {
 
         if let resources = mediaObject["display_resources"] as? [[String: Any]],
            let url = bestResourceURL(from: resources) {
+            log.info("bestImageURL: fell through to display_resources (\(resources.count) entries)", context: "resolution")
             return url
         }
 
         if let resources = mediaObject["thumbnail_resources"] as? [[String: Any]],
            let url = bestResourceURL(from: resources) {
+            log.warn("bestImageURL: fell through to thumbnail_resources — may be low-res", context: "resolution")
             return url
         }
 
         if let previewEdges = (mediaObject["edge_media_preview_image"] as? [String: Any])?["edges"] as? [[String: Any]],
            let url = bestGraphPreviewURL(from: previewEdges) {
+            log.warn("bestImageURL: fell through to edge_media_preview_image — may be low-res", context: "resolution")
             return url
         }
 
@@ -134,6 +145,7 @@ class InstagramService {
         }
 
         if let thumbnailSrc = mediaObject["thumbnail_src"] as? String, !thumbnailSrc.isEmpty {
+            log.warn("bestImageURL: fell through to thumbnail_src — this IS a thumbnail", context: "resolution")
             return thumbnailSrc
         }
 
@@ -382,7 +394,8 @@ class InstagramService {
         request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
         request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
         request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
-        request.setValue("1", forHTTPHeaderField: "dpr")
+        request.setValue("3", forHTTPHeaderField: "dpr")
+        request.setValue("1440", forHTTPHeaderField: "viewport-width")
         return request
     }
 
