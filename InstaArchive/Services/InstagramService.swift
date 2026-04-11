@@ -67,8 +67,77 @@ class InstagramService {
     /// ensures we always get the full-res image, not a thumbnail.
     private func bestImageURL(from candidates: [[String: Any]]) -> String? {
         return candidates
-            .sorted { ($0["width"] as? Int ?? 0) > ($1["width"] as? Int ?? 0) }
+            .sorted { candidateScore($0) > candidateScore($1) }
             .first?["url"] as? String
+    }
+
+    private func numericValue(_ value: Any?) -> Int {
+        if let int = value as? Int { return int }
+        if let double = value as? Double { return Int(double) }
+        if let string = value as? String, let int = Int(string) { return int }
+        return 0
+    }
+
+    private func candidateScore(_ candidate: [String: Any]) -> Int {
+        let width = numericValue(candidate["width"] ?? candidate["config_width"] ?? candidate["original_width"])
+        let height = numericValue(candidate["height"] ?? candidate["config_height"] ?? candidate["original_height"])
+        let bitrate = numericValue(candidate["bit_rate"] ?? candidate["bitrate"])
+        return max(width * height, (width * 10_000) + height + bitrate)
+    }
+
+    private func bestVideoURL(from candidates: [[String: Any]]) -> String? {
+        return candidates
+            .sorted { candidateScore($0) > candidateScore($1) }
+            .first?["url"] as? String
+            ?? candidates
+                .sorted { candidateScore($0) > candidateScore($1) }
+                .first?["src"] as? String
+    }
+
+    private func bestResourceURL(from resources: [[String: Any]]) -> String? {
+        return resources
+            .sorted { candidateScore($0) > candidateScore($1) }
+            .first?["src"] as? String
+    }
+
+    private func bestGraphPreviewURL(from edges: [[String: Any]]) -> String? {
+        let resources = edges.compactMap { $0["node"] as? [String: Any] }
+        return bestResourceURL(from: resources)
+    }
+
+    /// Resolve the best image URL from a mixed Instagram media object.
+    /// This prefers full image candidates and only falls back to preview fields
+    /// like `display_url` when no richer source is available.
+    private func bestImageURL(from mediaObject: [String: Any]) -> String? {
+        if let candidates = (mediaObject["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
+           let url = bestImageURL(from: candidates) {
+            return url
+        }
+
+        if let resources = mediaObject["display_resources"] as? [[String: Any]],
+           let url = bestResourceURL(from: resources) {
+            return url
+        }
+
+        if let resources = mediaObject["thumbnail_resources"] as? [[String: Any]],
+           let url = bestResourceURL(from: resources) {
+            return url
+        }
+
+        if let previewEdges = (mediaObject["edge_media_preview_image"] as? [String: Any])?["edges"] as? [[String: Any]],
+           let url = bestGraphPreviewURL(from: previewEdges) {
+            return url
+        }
+
+        if let displayURL = mediaObject["display_url"] as? String, !displayURL.isEmpty {
+            return displayURL
+        }
+
+        if let thumbnailSrc = mediaObject["thumbnail_src"] as? String, !thumbnailSrc.isEmpty {
+            return thumbnailSrc
+        }
+
+        return nil
     }
 
     // Rate limiting — thread-safe with lock
@@ -919,14 +988,13 @@ class InstagramService {
             let timestamp = item["taken_at_timestamp"] as? TimeInterval ?? Date().timeIntervalSince1970
 
             var mediaURLs: [String] = []
-            if isVideo, let videoURL = (item["video_resources"] as? [[String: Any]])?.first?["src"] as? String {
+            if isVideo,
+               let videoResources = item["video_resources"] as? [[String: Any]],
+               let videoURL = bestVideoURL(from: videoResources) {
                 mediaURLs.append(videoURL)
             } else if isVideo, let videoURL = item["video_url"] as? String {
                 mediaURLs.append(videoURL)
-            } else if let displayURL = item["display_url"] as? String {
-                mediaURLs.append(displayURL)
-            } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                      let url = bestImageURL(from: candidates) {
+            } else if let url = bestImageURL(from: item) {
                 mediaURLs.append(url)
             }
 
@@ -936,7 +1004,7 @@ class InstagramService {
                 instagramId: "story_\(storyId)",
                 mediaType: .story,
                 mediaURLs: mediaURLs,
-                thumbnailURL: item["display_url"] as? String,
+                thumbnailURL: bestImageURL(from: item),
                 caption: nil,
                 timestamp: Date(timeIntervalSince1970: timestamp),
                 isVideo: isVideo
@@ -966,18 +1034,15 @@ class InstagramService {
             var mediaURLs: [String] = []
             if isVideo,
                let videoVersions = item["video_versions"] as? [[String: Any]],
-               let bestVideo = videoVersions.first,
-               let videoURL = bestVideo["url"] as? String {
+               let videoURL = bestVideoURL(from: videoVersions) {
                 mediaURLs.append(videoURL)
-            } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                      let imageURL = bestImageURL(from: candidates) {
+            } else if let imageURL = bestImageURL(from: item) {
                 mediaURLs.append(imageURL)
             }
 
             guard !mediaURLs.isEmpty else { continue }
 
-            let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
-                .flatMap(bestImageURL(from:))
+            let thumbnailURL = bestImageURL(from: item)
 
             media.append(DiscoveredMedia(
                 instagramId: "story_\(storyId)",
@@ -1181,11 +1246,9 @@ class InstagramService {
             var mediaURLs: [String] = []
             if isVideo,
                let videoVersions = item["video_versions"] as? [[String: Any]],
-               let bestVideo = videoVersions.first,
-               let videoURL = bestVideo["url"] as? String {
+               let videoURL = bestVideoURL(from: videoVersions) {
                 mediaURLs.append(videoURL)
-            } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                      let imageURL = bestImageURL(from: candidates) {
+            } else if let imageURL = bestImageURL(from: item) {
                 mediaURLs.append(imageURL)
             }
 
@@ -1193,16 +1256,14 @@ class InstagramService {
             if mediaURLs.isEmpty {
                 if isVideo, let videoURL = item["video_url"] as? String {
                     mediaURLs.append(videoURL)
-                } else if let displayURL = item["display_url"] as? String {
-                    mediaURLs.append(displayURL)
+                } else if let imageURL = bestImageURL(from: item) {
+                    mediaURLs.append(imageURL)
                 }
             }
 
             guard !mediaURLs.isEmpty else { continue }
 
-            let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
-                .flatMap(bestImageURL(from:))
-                ?? item["display_url"] as? String
+            let thumbnailURL = bestImageURL(from: item)
 
             media.append(DiscoveredMedia(
                 instagramId: "highlight_\(highlightId)_\(itemId)",
@@ -1275,31 +1336,23 @@ class InstagramService {
             if mediaType == 8, let carouselMedia = item["carousel_media"] as? [[String: Any]] {
                 for carouselItem in carouselMedia {
                     if let videoVersions = carouselItem["video_versions"] as? [[String: Any]],
-                       let bestVideo = videoVersions.first,
-                       let videoURL = bestVideo["url"] as? String {
+                       let videoURL = bestVideoURL(from: videoVersions) {
                         mediaURLs.append(videoURL)
-                    } else if let candidates = (carouselItem["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                              let imageURL = bestImageURL(from: candidates) {
+                    } else if let imageURL = bestImageURL(from: carouselItem) {
                         mediaURLs.append(imageURL)
                     }
                 }
-                if let thumbCandidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]] {
-                    thumbnailURL = bestImageURL(from: thumbCandidates)
-                }
+                thumbnailURL = bestImageURL(from: item)
             } else if isVideo {
                 if let videoVersions = item["video_versions"] as? [[String: Any]],
-                   let bestVideo = videoVersions.first,
-                   let videoURL = bestVideo["url"] as? String {
+                   let videoURL = bestVideoURL(from: videoVersions) {
                     mediaURLs.append(videoURL)
                 }
                 let productType = item["product_type"] as? String ?? ""
                 itemMediaType = productType == "clips" ? .reel : .video
-                if let thumbCandidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]] {
-                    thumbnailURL = bestImageURL(from: thumbCandidates)
-                }
+                thumbnailURL = bestImageURL(from: item)
             } else {
-                if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                   let imageURL = bestImageURL(from: candidates) {
+                if let imageURL = bestImageURL(from: item) {
                     mediaURLs.append(imageURL)
                     thumbnailURL = imageURL
                 }
@@ -1441,27 +1494,23 @@ class InstagramService {
                 if let sidecarNode = sidecarEdge["node"] as? [String: Any] {
                     if let videoURL = sidecarNode["video_url"] as? String {
                         mediaURLs.append(videoURL)
-                    } else if let displayURL = sidecarNode["display_url"] as? String {
-                        mediaURLs.append(displayURL)
+                    } else if let imageURL = bestImageURL(from: sidecarNode) {
+                        mediaURLs.append(imageURL)
                     }
                 }
             }
         } else if let carouselMedia = node["carousel_media"] as? [[String: Any]] {
             for item in carouselMedia {
                 if let videoVersions = item["video_versions"] as? [[String: Any]],
-                   let url = videoVersions.first?["url"] as? String {
+                   let url = bestVideoURL(from: videoVersions) {
                     mediaURLs.append(url)
-                } else if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                          let url = bestImageURL(from: candidates) {
+                } else if let url = bestImageURL(from: item) {
                     mediaURLs.append(url)
                 }
             }
         } else if isVideo, let videoURL = node["video_url"] as? String {
             mediaURLs.append(videoURL)
-        } else if let displayURL = node["display_url"] as? String {
-            mediaURLs.append(displayURL)
-        } else if let candidates = (node["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                  let url = bestImageURL(from: candidates) {
+        } else if let url = bestImageURL(from: node) {
             mediaURLs.append(url)
         }
 
@@ -1471,10 +1520,7 @@ class InstagramService {
         let caption = (captionEdges?.first?["node"] as? [String: Any])?["text"] as? String
             ?? (node["caption"] as? [String: Any])?["text"] as? String
 
-        let thumbnailURL = node["thumbnail_src"] as? String
-            ?? node["display_url"] as? String
-            ?? ((node["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
-                .flatMap(bestImageURL(from:))
+        let thumbnailURL = bestImageURL(from: node)
 
         return DiscoveredMedia(
             instagramId: shortcode,
@@ -1535,11 +1581,11 @@ class InstagramService {
                     let searchEnd = min(html.index(range.upperBound, offsetBy: 1000, limitedBy: html.endIndex) ?? html.endIndex, html.endIndex)
                     let context = String(html[searchStart..<searchEnd])
 
-                    if let displayURL = extractURLFromContext(context, key: "display_url") {
+                    if let imageURL = extractBestImageURLFromContext(context) {
                         let isVideo = context.contains("\"is_video\":true")
                         let timestamp = extractTimestamp(from: context) ?? Date().timeIntervalSince1970
 
-                        var mediaURLs = [displayURL]
+                        var mediaURLs = [imageURL]
                         if isVideo, let videoURL = extractURLFromContext(context, key: "video_url") {
                             mediaURLs = [videoURL]
                         }
@@ -1548,7 +1594,7 @@ class InstagramService {
                             instagramId: shortcode,
                             mediaType: isVideo ? .video : .post,
                             mediaURLs: mediaURLs,
-                            thumbnailURL: displayURL,
+                            thumbnailURL: imageURL,
                             caption: nil,
                             timestamp: Date(timeIntervalSince1970: timestamp),
                             isVideo: isVideo
@@ -1681,32 +1727,27 @@ class InstagramService {
                 if mediaType == 8, let carouselMedia = item["carousel_media"] as? [[String: Any]] {
                     for carouselItem in carouselMedia {
                         if let videoVersions = carouselItem["video_versions"] as? [[String: Any]],
-                           let bestVideo = videoVersions.first,
-                           let videoURL = bestVideo["url"] as? String {
+                           let videoURL = bestVideoURL(from: videoVersions) {
                             mediaURLs.append(videoURL)
-                        } else if let candidates = (carouselItem["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                                  let imageURL = bestImageURL(from: candidates) {
+                        } else if let imageURL = bestImageURL(from: carouselItem) {
                             mediaURLs.append(imageURL)
                         }
                     }
                 } else if isVideo {
                     if let videoVersions = item["video_versions"] as? [[String: Any]],
-                       let bestVideo = videoVersions.first,
-                       let videoURL = bestVideo["url"] as? String {
+                       let videoURL = bestVideoURL(from: videoVersions) {
                         mediaURLs.append(videoURL)
                     }
                     let productType = item["product_type"] as? String ?? ""
                     itemMediaType = productType == "clips" ? .reel : .video
                 } else {
-                    if let candidates = (item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
-                       let imageURL = bestImageURL(from: candidates) {
+                    if let imageURL = bestImageURL(from: item) {
                         mediaURLs.append(imageURL)
                     }
                 }
 
                 if !mediaURLs.isEmpty {
-                    let thumbnailURL = ((item["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]])
-                        .flatMap(bestImageURL(from:))
+                    let thumbnailURL = bestImageURL(from: item)
                     return DiscoveredMedia(
                         instagramId: code,
                         mediaType: itemMediaType,
@@ -1756,14 +1797,14 @@ class InstagramService {
         var mediaURLs: [String] = []
         if let video = ogVideo, !video.isEmpty {
             mediaURLs.append(video)
-        } else if let image = ogImage, !image.isEmpty {
+        } else if let image = extractBestImageURLFromHTML(html) ?? ogImage, !image.isEmpty {
             mediaURLs.append(image)
         }
 
         // Also try embedded JSON
         if mediaURLs.isEmpty || !isVideo {
-            if let displayURL = extractURLFromHTML(html, key: "display_url") {
-                if mediaURLs.isEmpty { mediaURLs.append(displayURL) }
+            if let imageURL = extractBestImageURLFromHTML(html) {
+                if mediaURLs.isEmpty { mediaURLs.append(imageURL) }
             }
             if let videoURL = extractURLFromHTML(html, key: "video_url") {
                 mediaURLs = [videoURL]
@@ -1808,6 +1849,82 @@ class InstagramService {
         return String(context[range])
             .replacingOccurrences(of: "\\u0026", with: "&")
             .replacingOccurrences(of: "\\/", with: "/")
+    }
+
+    private func extractBestImageURLFromHTML(_ html: String) -> String? {
+        extractBestImageURL(from: html, arrayKeys: ["image_versions2", "display_resources", "thumbnail_resources"])
+            ?? extractURLFromHTML(html, key: "display_url")
+    }
+
+    private func extractBestImageURLFromContext(_ context: String) -> String? {
+        extractBestImageURL(from: context, arrayKeys: ["image_versions2", "display_resources", "thumbnail_resources"])
+            ?? extractURLFromContext(context, key: "display_url")
+    }
+
+    private func extractBestImageURL(from text: String, arrayKeys: [String]) -> String? {
+        for key in arrayKeys {
+            if let fragment = extractJSONArrayFragment(from: text, forKey: key),
+               let bestURL = bestURLInJSONArrayFragment(fragment) {
+                return bestURL
+            }
+        }
+        return nil
+    }
+
+    private func extractJSONArrayFragment(from text: String, forKey key: String) -> String? {
+        let pattern = "\"\(key)\"\\s*:\\s*(?:\\{\"candidates\":)?\\[(.*?)\\](?:\\})?"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+        return String(text[range])
+    }
+
+    private func bestURLInJSONArrayFragment(_ fragment: String) -> String? {
+        let objectPattern = "\\{[^\\{\\}]*\\}"
+        guard let regex = try? NSRegularExpression(pattern: objectPattern) else {
+            return nil
+        }
+
+        let matches = regex.matches(in: fragment, range: NSRange(fragment.startIndex..., in: fragment))
+        var bestURL: String?
+        var bestScore = 0
+
+        for match in matches {
+            guard let range = Range(match.range, in: fragment) else { continue }
+            let object = String(fragment[range])
+            let url = extractURLFromContext(object, key: "url") ?? extractURLFromContext(object, key: "src")
+            guard let url else { continue }
+
+            let width = extractInteger(from: object, key: "width")
+                ?? extractInteger(from: object, key: "config_width")
+                ?? extractInteger(from: object, key: "original_width")
+                ?? 0
+            let height = extractInteger(from: object, key: "height")
+                ?? extractInteger(from: object, key: "config_height")
+                ?? extractInteger(from: object, key: "original_height")
+                ?? 0
+            let score = max(width * height, (width * 10_000) + height)
+
+            if score > bestScore {
+                bestScore = score
+                bestURL = url
+            }
+        }
+
+        return bestURL
+    }
+
+    private func extractInteger(from text: String, key: String) -> Int? {
+        let pattern = "\"\(key)\":(\\d+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+              let range = Range(match.range(at: 1), in: text) else {
+            return nil
+        }
+
+        return Int(text[range])
     }
 
     private func extractTimestamp(from context: String) -> TimeInterval? {

@@ -652,23 +652,65 @@ class InstagramService:
             return node["video_url"]
         vv = node.get("video_versions")
         if vv and isinstance(vv, list):
-            return vv[0].get("url")
+            best = max(vv, key=self._candidate_score)
+            return best.get("url") or best.get("src")
         # Image — pick highest res
         candidates = node.get("image_versions2", {}).get("candidates", [])
         if candidates:
-            best = max(candidates, key=lambda c: c.get("width", 0) * c.get("height", 0))
+            best = max(candidates, key=self._candidate_score)
             return best.get("url")
+        resources = node.get("display_resources")
+        if resources and isinstance(resources, list):
+            best = max(resources, key=self._candidate_score)
+            if best.get("src"):
+                return best.get("src")
+        thumb_resources = node.get("thumbnail_resources")
+        if thumb_resources and isinstance(thumb_resources, list):
+            best = max(thumb_resources, key=self._candidate_score)
+            if best.get("src"):
+                return best.get("src")
         # GraphQL display_url
         resources = node.get("edge_media_preview_image", {}).get("edges", [])
         if resources:
-            return resources[-1].get("node", {}).get("src")
-        return node.get("display_url")
+            preview_nodes = [edge.get("node", {}) for edge in resources]
+            preview_nodes = [preview for preview in preview_nodes if isinstance(preview, dict)]
+            if preview_nodes:
+                best = max(preview_nodes, key=self._candidate_score)
+                if best.get("src"):
+                    return best.get("src")
+        return node.get("display_url") or node.get("thumbnail_src")
 
     def _thumbnail_url(self, node: dict) -> Optional[str]:
         candidates = node.get("image_versions2", {}).get("candidates", [])
         if candidates:
-            return candidates[-1].get("url")
+            best = max(candidates, key=self._candidate_score)
+            return best.get("url")
+        resources = node.get("display_resources")
+        if resources and isinstance(resources, list):
+            best = max(resources, key=self._candidate_score)
+            if best.get("src"):
+                return best.get("src")
         return node.get("thumbnail_src") or node.get("display_url")
+
+    def _candidate_score(self, candidate: dict) -> int:
+        width = self._int_value(
+            candidate.get("width")
+            or candidate.get("config_width")
+            or candidate.get("original_width")
+        )
+        height = self._int_value(
+            candidate.get("height")
+            or candidate.get("config_height")
+            or candidate.get("original_height")
+        )
+        bitrate = self._int_value(candidate.get("bit_rate") or candidate.get("bitrate"))
+        return max(width * height, (width * 10_000) + height + bitrate)
+
+    def _int_value(self, value) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
 
     # ------------------------------------------------------------------
     # Stories
