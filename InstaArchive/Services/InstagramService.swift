@@ -71,8 +71,15 @@ class InstagramService {
             let w = numericValue(best["width"])
             let h = numericValue(best["height"])
             let smallest = sorted.last.flatMap { numericValue($0["width"]) } ?? 0
+            let allWidths = sorted.map { numericValue($0["width"]) }
+            // Track max candidate width for strategy fallback decisions
+            if w > lastMaxCandidateWidth { lastMaxCandidateWidth = w }
             if w < 500 {
-                log.warn("bestImageURL: picked \(w)x\(h) — only \(candidates.count) candidates, smallest=\(smallest)px. URL prefix: \(String(url.prefix(80)))", context: "resolution")
+                log.warn("bestImageURL: picked \(w)x\(h) — only \(candidates.count) candidates (widths: \(allWidths)), smallest=\(smallest)px. URL prefix: \(String(url.prefix(80)))", context: "resolution")
+            } else if w >= 1080 {
+                log.info("bestImageURL: picked \(w)x\(h) from \(candidates.count) candidates (widths: \(allWidths))", context: "resolution")
+            } else {
+                log.info("bestImageURL: picked \(w)x\(h) — \(candidates.count) candidates (widths: \(allWidths)), best < 1080", context: "resolution")
             }
             return url
         }
@@ -165,6 +172,11 @@ class InstagramService {
     private var igWWWClaim: String = "0"   // X-IG-WWW-Claim header (0 = logged out)
     private var sessionInitialized = false
     private var cachedUserIds: [String: String] = [:]
+
+    /// Tracks the widest candidate width seen in the most recent parsing pass.
+    /// Used to detect when the v1 API returns degraded/low-res candidates so
+    /// we can fall through to GraphQL which typically has display_url at 1080px+.
+    private var lastMaxCandidateWidth: Int = 0
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -415,8 +427,18 @@ class InstagramService {
         request.setValue("same-origin", forHTTPHeaderField: "Sec-Fetch-Site")
         request.setValue("cors", forHTTPHeaderField: "Sec-Fetch-Mode")
         request.setValue("empty", forHTTPHeaderField: "Sec-Fetch-Dest")
-        request.setValue("3", forHTTPHeaderField: "dpr")
-        request.setValue("1440", forHTTPHeaderField: "viewport-width")
+        // NOTE: Do NOT send 'dpr' or 'viewport-width' headers.
+        // Instagram's API optimises candidate sets for the declared DPR.
+        // With dpr:3 it returns only 2 candidates (150px & 480px) because
+        // 480 * 3 = 1440 effective pixels. Omitting these headers makes the
+        // API return the full standard candidate set (up to 1440px actual),
+        // which is what the real desktop Chrome web client does for XHR.
+        // Signal high-bandwidth connection so Instagram serves full-quality content
+        request.setValue("WIFI", forHTTPHeaderField: "X-IG-Connection-Type")
+        request.setValue("3700", forHTTPHeaderField: "X-IG-Bandwidth-Speed-KBPS")
+        request.setValue("3726400", forHTTPHeaderField: "X-IG-Bandwidth-TotalBytes-B")
+        request.setValue("1200", forHTTPHeaderField: "X-IG-Bandwidth-TotalTime-MS")
+        request.setValue("3700", forHTTPHeaderField: "X-IG-ABR-Connection-Speed-KBPS")
         return request
     }
 
@@ -816,6 +838,7 @@ class InstagramService {
 
         workingStrategy = nil
         paginationDepth = 0
+        lastMaxCandidateWidth = 0
         var allMedia: [DiscoveredMedia] = []
         var cursor: String? = nil
         var hasMore = true
@@ -889,8 +912,19 @@ class InstagramService {
         if let strategy = workingStrategy {
             switch strategy {
             case "v1":
+                lastMaxCandidateWidth = 0
                 if let result = try? await fetchMediaViaAPI(username: username, cursor: cursor),
                    !result.media.isEmpty {
+                    // If v1 returned items but all candidates were low-res, try GraphQL instead
+                    if lastMaxCandidateWidth > 0 && lastMaxCandidateWidth < 1080 {
+                        log.warn("v1 strategy returned low-res (\(lastMaxCandidateWidth)px max), trying GraphQL for full-res", context: "media")
+                        lastMaxCandidateWidth = 0
+                        if let gqlResult = try? await fetchMediaViaGraphQL(username: username, cursor: cursor),
+                           !gqlResult.media.isEmpty {
+                            workingStrategy = "graphql"
+                            return gqlResult
+                        }
+                    }
                     return result
                 }
             case "graphql":
@@ -907,12 +941,19 @@ class InstagramService {
         }
 
         // Strategy 1: v1 API
+        lastMaxCandidateWidth = 0
         do {
             let result = try await fetchMediaViaAPI(username: username, cursor: cursor)
             if !result.media.isEmpty {
-                workingStrategy = "v1"
-                log.info("v1 API: \(result.media.count) items for @\(username)", context: "media")
-                return result
+                // Check if v1 API returned full-res candidates
+                if lastMaxCandidateWidth > 0 && lastMaxCandidateWidth < 1080 {
+                    log.warn("v1 API returned low-res (\(lastMaxCandidateWidth)px max), trying GraphQL for full-res", context: "media")
+                    // Don't commit to v1 — try GraphQL for better resolution
+                } else {
+                    workingStrategy = "v1"
+                    log.info("v1 API: \(result.media.count) items for @\(username) (max \(lastMaxCandidateWidth)px)", context: "media")
+                    return result
+                }
             } else {
                 log.info("v1 API: 0 items for @\(username)", context: "media")
             }
@@ -921,11 +962,12 @@ class InstagramService {
         }
 
         // Strategy 2: GraphQL
+        lastMaxCandidateWidth = 0
         do {
             let result = try await fetchMediaViaGraphQL(username: username, cursor: cursor)
             if !result.media.isEmpty {
                 workingStrategy = "graphql"
-                log.info("GraphQL: \(result.media.count) items for @\(username)", context: "media")
+                log.info("GraphQL: \(result.media.count) items for @\(username) (max \(lastMaxCandidateWidth)px)", context: "media")
                 return result
             } else {
                 log.info("GraphQL: 0 items for @\(username)", context: "media")
