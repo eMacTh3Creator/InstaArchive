@@ -178,6 +178,15 @@ class InstagramService {
     /// we can fall through to GraphQL which typically has display_url at 1080px+.
     private var lastMaxCandidateWidth: Int = 0
 
+    /// Whether CDN URL upgrades (removing size constraints from `stp` param)
+    /// work for this session.  nil = untested, true = works, false = broken.
+    private var cdnUpgradeVerified: Bool? = nil
+
+    /// Cache of shortcode → media PK populated during v1 feed parsing.
+    /// Enables per-post `/api/v1/media/{pk}/info/` fetching as a fallback
+    /// if CDN URL upgrades stop working in the future.
+    private var mediaPKCache: [String: String] = [:]
+
     private init() {
         let config = URLSessionConfiguration.default
         config.httpCookieAcceptPolicy = .always
@@ -1416,6 +1425,13 @@ class InstagramService {
             let isVideo = mediaType == 2
             let timestamp = item["taken_at"] as? TimeInterval ?? Date().timeIntervalSince1970
 
+            // Cache media PK for potential per-post full-res fetching
+            if !code.isEmpty {
+                if let pk = item["pk"] as? Int64 { mediaPKCache[code] = String(pk) }
+                else if let pk = item["pk"] as? String { mediaPKCache[code] = pk }
+                else if let pk = item["pk"] as? Int { mediaPKCache[code] = String(pk) }
+            }
+
             let caption = (item["caption"] as? [String: Any])?["text"] as? String
 
             var mediaURLs: [String] = []
@@ -1506,6 +1522,8 @@ class InstagramService {
 
     private func parseGraphQLMediaResponse(from data: Data, username: String) throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            let preview = String(data: data.prefix(500), encoding: .utf8) ?? "(binary, \(data.count) bytes)"
+            log.error("GraphQL response is not valid JSON for @\(username). Preview: \(preview)", context: "graphql")
             throw InstagramError.parsingError("Invalid JSON response")
         }
 
@@ -1518,6 +1536,10 @@ class InstagramService {
                   let xdt = d["xdt_api__v1__feed__user_timeline_graphql_connection"] as? [String: Any] {
             return try parseModernGraphQLResponse(xdt, username: username)
         } else {
+            let topKeys = Array(json.keys).sorted().joined(separator: ", ")
+            let status = json["status"] as? String ?? "none"
+            let message = json["message"] as? String ?? ""
+            log.error("GraphQL unexpected structure for @\(username). status=\(status), message=\(message), keys=[\(topKeys)]", context: "graphql")
             throw InstagramError.parsingError("Unexpected GraphQL response structure")
         }
 
@@ -2075,12 +2097,82 @@ class InstagramService {
         throw InstagramError.parsingError("Could not resolve user ID for @\(username). You may need to log in again.")
     }
 
+    // MARK: - CDN URL Resolution Upgrade
+
+    /// Upgrade an Instagram CDN image URL to request original/full resolution
+    /// by removing size-limiting transform parameters.
+    ///
+    /// Instagram CDN URLs include a `stp` query parameter that controls server-side
+    /// processing: e.g. `stp=dst-jpg_e35_p480x480` means "JPEG, quality e35, cap at
+    /// 480×480". The `_p{W}x{H}` suffix is a resize directive. Removing it while
+    /// keeping the format/encoding (`dst-jpg_e35`) instructs the CDN to serve the
+    /// original resolution. Crucially, `stp` is NOT part of the `oh`/`oe` URL
+    /// signature, so modifying it does not break the signed URL.
+    private func upgradeImageURL(_ urlString: String) -> String {
+        guard var components = URLComponents(string: urlString),
+              let host = components.host,
+              host.contains("cdninstagram.com") || host.contains("fbcdn.net") else {
+            return urlString   // Not an Instagram CDN URL
+        }
+
+        guard var queryItems = components.queryItems else { return urlString }
+
+        var modified = false
+        for (index, item) in queryItems.enumerated() where item.name == "stp" {
+            if let value = item.value {
+                // Remove proportional-resize (_p480x480) and square-crop (_s150x150) directives.
+                // Keep format/encoding prefix (dst-jpg_e35).
+                let cleaned = value.replacingOccurrences(
+                    of: "_[ps]\\d+x\\d+",
+                    with: "",
+                    options: .regularExpression
+                )
+                if cleaned != value {
+                    queryItems[index] = URLQueryItem(name: "stp", value: cleaned)
+                    modified = true
+                }
+            }
+        }
+
+        if modified {
+            components.queryItems = queryItems
+            return components.url?.absoluteString ?? urlString
+        }
+        return urlString
+    }
+
     // MARK: - Download Media File
 
     func downloadMediaData(from urlString: String) async throws -> Data {
         // No rate limiting for CDN downloads — these are pre-signed URLs
         // that don't count against Instagram's API rate limit.
 
+        // Try CDN URL upgrade for full resolution (remove size constraints)
+        if cdnUpgradeVerified != false {
+            let upgraded = upgradeImageURL(urlString)
+            if upgraded != urlString {
+                do {
+                    let data = try await performCDNDownload(from: upgraded)
+                    if cdnUpgradeVerified == nil {
+                        cdnUpgradeVerified = true
+                        log.info("CDN URL upgrade works — downloading original-resolution images", context: "resolution")
+                    }
+                    return data
+                } catch {
+                    if cdnUpgradeVerified == nil {
+                        cdnUpgradeVerified = false
+                        log.warn("CDN URL upgrade rejected (\(error.localizedDescription)) — using API-provided URLs as-is", context: "resolution")
+                    }
+                    // Fall through to original URL
+                }
+            }
+        }
+
+        return try await performCDNDownload(from: urlString)
+    }
+
+    /// Raw CDN download without any URL rewriting.
+    private func performCDNDownload(from urlString: String) async throws -> Data {
         guard let url = URL(string: urlString) else {
             throw InstagramError.invalidURL
         }
@@ -2093,12 +2185,12 @@ class InstagramService {
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            print("[InstaArchive] Download failed with status \(statusCode) for URL: \(urlString.prefix(80))...")
+            log.warn("CDN download HTTP \(statusCode) for URL: \(String(urlString.prefix(120)))", context: "download")
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
         guard data.count > 100 else {
-            print("[InstaArchive] Downloaded data suspiciously small (\(data.count) bytes)")
+            log.warn("CDN download suspiciously small (\(data.count) bytes)", context: "download")
             throw InstagramError.parsingError("Downloaded file is too small, likely an error page")
         }
 
