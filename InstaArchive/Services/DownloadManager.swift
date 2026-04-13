@@ -304,7 +304,7 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 await self.performCheck(profile, profileStore: profileStore)
                 if stopAllRequested || Task.isCancelled { break }
                 if shuffled.count > 1 && index < shuffled.count - 1 {
-                    let cooldown = Double.random(in: 20...60)
+                    let cooldown = Double.random(in: 45...120)
                     try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
                 }
             }
@@ -651,12 +651,12 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 if index < profiles.count - 1 {
                     let cooldown: Double
                     if completedInBatch >= batchSize {
-                        cooldown = Double.random(in: 180...420)
+                        cooldown = Double.random(in: 300...600)
                         completedInBatch = 0
                         self.log.info("Batch cooldown: pausing \(Int(cooldown))s after \(batchSize) profiles", context: "rate")
-                        self.setActivity("Cooldown before next batch (\(Int(cooldown))s)...")
+                        self.setActivity("Cooldown before next batch (\(Int(cooldown / 60))min)...")
                     } else {
-                        cooldown = Double.random(in: 20...60)
+                        cooldown = Double.random(in: 45...120)
                     }
                     try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
                 }

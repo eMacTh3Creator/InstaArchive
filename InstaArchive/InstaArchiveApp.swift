@@ -74,6 +74,7 @@ struct InstaArchiveApp: App {
                 if settings.webServerEnabled {
                     webServer.start(profileStore: profileStore)
                 }
+                UpdateChecker.shared.startScheduledChecks()
             }
         }
         .windowStyle(.titleBar)

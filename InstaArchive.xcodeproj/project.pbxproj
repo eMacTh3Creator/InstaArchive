@@ -29,6 +29,7 @@
 		AA000020 /* ThumbnailCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000022 /* ThumbnailCache.swift */; };
 		AA000021 /* WebServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000023 /* WebServer.swift */; };
 		AA000022 /* Logger.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000024 /* Logger.swift */; };
+		AA000023 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000025 /* UpdateChecker.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -56,6 +57,7 @@
 		AB000022 /* ThumbnailCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailCache.swift; sourceTree = "<group>"; };
 		AB000023 /* WebServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WebServer.swift; sourceTree = "<group>"; };
 		AB000024 /* Logger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Logger.swift; sourceTree = "<group>"; };
+		AB000025 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
 		AC000001 /* InstaArchive.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = InstaArchive.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -129,6 +131,7 @@
 				AB000022 /* ThumbnailCache.swift */,
 				AB000023 /* WebServer.swift */,
 				AB000024 /* Logger.swift */,
+				AB000025 /* UpdateChecker.swift */,
 			);
 			path = Services;
 			sourceTree = "<group>";
@@ -239,6 +242,7 @@
 			AA000020 /* ThumbnailCache.swift in Sources */,
 			AA000021 /* WebServer.swift in Sources */,
 			AA000022 /* Logger.swift in Sources */,
+			AA000023 /* UpdateChecker.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

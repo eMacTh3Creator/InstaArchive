@@ -155,12 +155,14 @@ class InstagramService {
     // Rate limiting — thread-safe with lock
     private var lastRequestTime: Date?
     private let rateLock = NSLock()
-    private let minimumRequestInterval: TimeInterval = 3.0
+    private let minimumRequestInterval: TimeInterval = 5.0
     private var requestCount: Int = 0
     private var hourWindowStart: Date = Date()
+    private var paginationDepth: Int = 0  // Tracks how deep into pagination we are
 
     // Session state
     private var csrfToken: String?
+    private var igWWWClaim: String = "0"   // X-IG-WWW-Claim header (0 = logged out)
     private var sessionInitialized = false
     private var cachedUserIds: [String: String] = [:]
 
@@ -193,15 +195,16 @@ class InstagramService {
         let existingCookies = HTTPCookieStorage.shared.cookies ?? []
         let hasSessionId = existingCookies.contains { $0.name == "sessionid" && $0.domain.contains("instagram") && !$0.value.isEmpty }
         if hasSessionId {
-            // We have login cookies — extract CSRF token from them
-            for cookie in existingCookies where cookie.name == "csrftoken" && cookie.domain.contains("instagram") {
-                csrfToken = cookie.value
+            // We have login cookies — extract CSRF token and claim from them
+            for cookie in existingCookies where cookie.domain.contains("instagram") {
+                if cookie.name == "csrftoken" { csrfToken = cookie.value }
+                if cookie.name == "ig_www_claim" { igWWWClaim = cookie.value }
             }
             if csrfToken == nil {
                 csrfToken = generateCSRFToken()
             }
             sessionInitialized = true
-            print("[InstaArchive] Session initialized from existing login cookies (authenticated)")
+            print("[InstaArchive] Session initialized from existing login cookies (authenticated, claim=\(igWWWClaim != "0" ? "yes" : "no"))")
             return
         }
 
@@ -246,12 +249,24 @@ class InstagramService {
                 csrfToken = generateCSRFToken()
             }
 
-            let isAuthenticated = (HTTPCookieStorage.shared.cookies ?? []).contains {
+            // Extract ig_www_claim from cookies or response headers
+            let allCookies = HTTPCookieStorage.shared.cookies ?? []
+            for cookie in allCookies where cookie.domain.contains("instagram") {
+                if cookie.name == "ig_www_claim" && !cookie.value.isEmpty { igWWWClaim = cookie.value }
+            }
+            // Also check X-IG-Set-WWW-Claim response header
+            if let httpResp = response as? HTTPURLResponse,
+               let claim = httpResp.value(forHTTPHeaderField: "X-IG-Set-WWW-Claim"),
+               !claim.isEmpty {
+                igWWWClaim = claim
+            }
+
+            let isAuthenticated = allCookies.contains {
                 $0.name == "sessionid" && $0.domain.contains("instagram") && !$0.value.isEmpty
             }
 
             sessionInitialized = true
-            print("[InstaArchive] Session initialized, CSRF: \(csrfToken != nil ? "yes" : "no"), authenticated: \(isAuthenticated)")
+            print("[InstaArchive] Session initialized, CSRF: \(csrfToken != nil ? "yes" : "no"), authenticated: \(isAuthenticated), claim: \(igWWWClaim != "0" ? "yes" : "no")")
         } catch {
             log.error("Session init failed: \(error.localizedDescription)", context: "session")
             throw InstagramError.sessionError
@@ -306,21 +321,26 @@ class InstagramService {
         // Human-like jitter: mix of short and occasional longer pauses
         let roll = Double.random(in: 0...1)
         let jitter: Double
-        if roll < 0.7 {
-            jitter = Double.random(in: 1.0...3.5)     // 70%: normal browsing pace
-        } else if roll < 0.92 {
-            jitter = Double.random(in: 3.5...8.0)     // 22%: slower / reading pause
+        if roll < 0.55 {
+            jitter = Double.random(in: 2.0...5.0)     // 55%: normal browsing pace
+        } else if roll < 0.82 {
+            jitter = Double.random(in: 5.0...12.0)    // 27%: slower / reading pause
+        } else if roll < 0.95 {
+            jitter = Double.random(in: 12.0...25.0)   // 13%: long pause (distracted)
         } else {
-            jitter = Double.random(in: 8.0...15.0)    // 8%: long pause (distracted)
+            jitter = Double.random(in: 25.0...45.0)   //  5%: very long pause (tab-switched)
         }
-        let effectiveInterval = minimumRequestInterval + jitter
+
+        // Deeper into pagination → longer delays (mimics scroll fatigue)
+        let depthMultiplier = 1.0 + Double(min(paginationDepth, 10)) * 0.1
+        let effectiveInterval = (minimumRequestInterval + jitter) * depthMultiplier
 
         let (last, currentCount) = rateLimitState()
 
-        // If approaching hourly limit, add progressive backoff
-        if currentCount > 180 {
-            let extraDelay = Double(currentCount - 180) * 2.0
-            log.warn("Approaching hourly request limit (\(currentCount)/200), adding \(Int(extraDelay))s cooldown", context: "rate")
+        // If approaching hourly limit, add aggressive progressive backoff
+        if currentCount > 100 {
+            let extraDelay = Double(currentCount - 100) * 3.0
+            log.warn("Approaching hourly request limit (\(currentCount)/120), adding \(Int(extraDelay))s cooldown", context: "rate")
             try? await Task.sleep(nanoseconds: UInt64(extraDelay * 1_000_000_000))
         }
 
@@ -387,6 +407,7 @@ class InstagramService {
         var request = URLRequest(url: url)
         request.setValue(igAppId, forHTTPHeaderField: "X-IG-App-ID")
         request.setValue(csrfToken ?? "", forHTTPHeaderField: "X-CSRFToken")
+        request.setValue(igWWWClaim, forHTTPHeaderField: "X-IG-WWW-Claim")
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
         request.setValue("application/json, text/javascript, */*; q=0.01", forHTTPHeaderField: "Accept")
         request.setValue(referer ?? "https://www.instagram.com/", forHTTPHeaderField: "Referer")
@@ -397,6 +418,15 @@ class InstagramService {
         request.setValue("3", forHTTPHeaderField: "dpr")
         request.setValue("1440", forHTTPHeaderField: "viewport-width")
         return request
+    }
+
+    /// Update the WWW claim from API response headers (Instagram rotates this).
+    private func captureClaimFromResponse(_ response: URLResponse?) {
+        guard let http = response as? HTTPURLResponse else { return }
+        if let claim = http.value(forHTTPHeaderField: "X-IG-Set-WWW-Claim"),
+           !claim.isEmpty, claim != "0" {
+            igWWWClaim = claim
+        }
     }
 
     // MARK: - Profile Info
@@ -413,6 +443,7 @@ class InstagramService {
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
 
         let (data, response) = try await session.data(for: request)
+        captureClaimFromResponse(response)
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw InstagramError.networkError(URLError(.badServerResponse))
@@ -784,6 +815,7 @@ class InstagramService {
         try await ensureSession()
 
         workingStrategy = nil
+        paginationDepth = 0
         var allMedia: [DiscoveredMedia] = []
         var cursor: String? = nil
         var hasMore = true
@@ -1311,8 +1343,10 @@ class InstagramService {
         }
 
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
+        paginationDepth += 1
 
         let (data, response) = try await session.data(for: request)
+        captureClaimFromResponse(response)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
@@ -1416,8 +1450,10 @@ class InstagramService {
         }
 
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
+        paginationDepth += 1
 
         let (data, response) = try await session.data(for: request)
+        captureClaimFromResponse(response)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             throw InstagramError.networkError(URLError(.badServerResponse))
