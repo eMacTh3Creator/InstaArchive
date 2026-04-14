@@ -924,16 +924,7 @@ class InstagramService {
                 lastMaxCandidateWidth = 0
                 if let result = try? await fetchMediaViaAPI(username: username, cursor: cursor),
                    !result.media.isEmpty {
-                    // If v1 returned items but all candidates were low-res, try GraphQL instead
-                    if lastMaxCandidateWidth > 0 && lastMaxCandidateWidth < 1080 {
-                        log.warn("v1 strategy returned low-res (\(lastMaxCandidateWidth)px max), trying GraphQL for full-res", context: "media")
-                        lastMaxCandidateWidth = 0
-                        if let gqlResult = try? await fetchMediaViaGraphQL(username: username, cursor: cursor),
-                           !gqlResult.media.isEmpty {
-                            workingStrategy = "graphql"
-                            return gqlResult
-                        }
-                    }
+                    log.info("v1 API page: \(result.media.count) items (max \(lastMaxCandidateWidth)px, CDN upgrade handles res)", context: "media")
                     return result
                 }
             case "graphql":
@@ -950,19 +941,18 @@ class InstagramService {
         }
 
         // Strategy 1: v1 API
+        // NOTE: We ALWAYS accept v1 results regardless of candidate resolution.
+        // The v1 feed API intentionally returns reduced candidates (150/480px)
+        // as a bandwidth optimisation — this is normal Instagram behaviour, not
+        // a session problem. The CDN URL upgrade in downloadMediaData() rewrites
+        // these URLs at download time to request original resolution.
         lastMaxCandidateWidth = 0
         do {
             let result = try await fetchMediaViaAPI(username: username, cursor: cursor)
             if !result.media.isEmpty {
-                // Check if v1 API returned full-res candidates
-                if lastMaxCandidateWidth > 0 && lastMaxCandidateWidth < 1080 {
-                    log.warn("v1 API returned low-res (\(lastMaxCandidateWidth)px max), trying GraphQL for full-res", context: "media")
-                    // Don't commit to v1 — try GraphQL for better resolution
-                } else {
-                    workingStrategy = "v1"
-                    log.info("v1 API: \(result.media.count) items for @\(username) (max \(lastMaxCandidateWidth)px)", context: "media")
-                    return result
-                }
+                workingStrategy = "v1"
+                log.info("v1 API: \(result.media.count) items for @\(username) (max \(lastMaxCandidateWidth)px, CDN upgrade handles res)", context: "media")
+                return result
             } else {
                 log.info("v1 API: 0 items for @\(username)", context: "media")
             }
