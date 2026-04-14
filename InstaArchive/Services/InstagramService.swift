@@ -2151,6 +2151,19 @@ class InstagramService {
     }
 
     /// Raw CDN download without any URL rewriting.
+    ///
+    /// IMPORTANT (v1.5.13): the Accept header explicitly prefers JPEG + MP4.
+    /// v1.5.12 sent `image/avif,image/webp,image/apng,...` which matched what
+    /// Chrome actually asks for, but Instagram's CDN honored it and served
+    /// WebP/AVIF bytes — which then got saved with the storage layer's
+    /// hardcoded `.jpg` extension, producing "damaged" files at the correct
+    /// resolution. Forcing `image/jpeg` first makes the CDN serve JPEG so the
+    /// extension matches the content.
+    ///
+    /// Image responses are additionally validated against the JPEG magic
+    /// bytes (`FF D8 FF`). If a CDN-upgraded URL still returns non-JPEG
+    /// bytes, this throws, and `downloadMediaData` falls back to the
+    /// original (non-upgraded) URL.
     private func performCDNDownload(from urlString: String) async throws -> Data {
         guard let url = URL(string: urlString) else {
             throw InstagramError.invalidURL
@@ -2158,19 +2171,38 @@ class InstagramService {
 
         var request = URLRequest(url: url)
         request.setValue("https://www.instagram.com/", forHTTPHeaderField: "Referer")
-        request.setValue("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("image/jpeg,video/mp4,image/*;q=0.9,*/*;q=0.5", forHTTPHeaderField: "Accept")
 
         let (data, response) = try await session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            log.warn("CDN download HTTP \(statusCode) for URL: \(String(urlString.prefix(120)))", context: "download")
+        guard let httpResponse = response as? HTTPURLResponse else {
+            log.warn("CDN download got non-HTTP response for URL: \(String(urlString.prefix(120)))", context: "download")
+            throw InstagramError.networkError(URLError(.badServerResponse))
+        }
+
+        let contentType = httpResponse.value(forHTTPHeaderField: "Content-Type") ?? "(none)"
+
+        guard httpResponse.statusCode == 200 else {
+            log.warn("CDN download HTTP \(httpResponse.statusCode) ct=\(contentType) url: \(String(urlString.prefix(120)))", context: "download")
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
         guard data.count > 100 else {
-            log.warn("CDN download suspiciously small (\(data.count) bytes)", context: "download")
+            log.warn("CDN download suspiciously small (\(data.count) bytes) ct=\(contentType)", context: "download")
             throw InstagramError.parsingError("Downloaded file is too small, likely an error page")
+        }
+
+        // If the server claims it's an image, require JPEG. StorageManager hardcodes
+        // `.jpg` for all non-video media, so any other format (WebP/AVIF/PNG) would
+        // produce an unreadable file — exactly the "damaged but proper resolution"
+        // symptom seen in v1.5.12.
+        if contentType.hasPrefix("image/") {
+            let isJPEG = data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
+            if !isJPEG {
+                let firstBytes = data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+                log.warn("CDN returned non-JPEG image (\(data.count) bytes, ct=\(contentType), magic=[\(firstBytes)]) url: \(String(urlString.prefix(120)))", context: "download")
+                throw InstagramError.parsingError("CDN returned \(contentType) instead of JPEG")
+            }
         }
 
         return data
