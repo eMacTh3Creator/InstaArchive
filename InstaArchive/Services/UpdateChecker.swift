@@ -18,13 +18,28 @@ class UpdateChecker: ObservableObject {
         static let skippedVersion = "skippedVersion"
     }
 
-    /// "daily" or "weekly"
+    /// "manual", "daily", or "weekly".
+    /// "manual" disables scheduled checks entirely — the user must tap "Check Now".
     @Published var checkInterval: String {
-        didSet { defaults.set(checkInterval, forKey: Keys.updateCheckInterval) }
+        didSet {
+            defaults.set(checkInterval, forKey: Keys.updateCheckInterval)
+            // Switching to/from "manual" needs the timer torn down or restarted.
+            if autoUpdateEnabled {
+                startScheduledChecks()
+            }
+        }
     }
 
     @Published var autoUpdateEnabled: Bool {
-        didSet { defaults.set(autoUpdateEnabled, forKey: Keys.autoUpdateEnabled) }
+        didSet {
+            defaults.set(autoUpdateEnabled, forKey: Keys.autoUpdateEnabled)
+            // React to toggles at runtime so the user doesn't need to restart the app.
+            if autoUpdateEnabled {
+                startScheduledChecks()
+            } else {
+                stopScheduledChecks()
+            }
+        }
     }
 
     @Published var lastCheckDate: Date? {
@@ -61,7 +76,11 @@ class UpdateChecker: ObservableObject {
     // MARK: - Lifecycle
 
     func startScheduledChecks() {
-        guard autoUpdateEnabled else { return }
+        // Idempotent: tear down any prior timer before scheduling a new one
+        // so repeated calls (e.g. toggling auto-update in settings) don't leak.
+        stopScheduledChecks()
+
+        guard autoUpdateEnabled, checkInterval != "manual" else { return }
 
         // Check on launch if due
         if isDueForCheck() {
@@ -69,13 +88,12 @@ class UpdateChecker: ObservableObject {
         }
 
         // Schedule periodic checks (every 6 hours; actual interval logic is in isDueForCheck)
-        checkTimer = Timer.scheduledTimer(withTimeInterval: 6 * 3600, repeats: true) { [weak self] _ in
+        let timer = Timer(timeInterval: 6 * 3600, repeats: true) { [weak self] _ in
             guard let self = self, self.autoUpdateEnabled, self.isDueForCheck() else { return }
             Task { await self.checkForUpdate() }
         }
-        if let timer = checkTimer {
-            RunLoop.main.add(timer, forMode: .common)
-        }
+        RunLoop.main.add(timer, forMode: .common)
+        checkTimer = timer
     }
 
     func stopScheduledChecks() {
@@ -87,11 +105,21 @@ class UpdateChecker: ObservableObject {
         guard let last = lastCheckDate else { return true }
         let elapsed = Date().timeIntervalSince(last)
         switch checkInterval {
+        case "manual":
+            return false
         case "weekly":
             return elapsed > 7 * 24 * 3600
         default: // daily
             return elapsed > 24 * 3600
         }
+    }
+
+    /// Human-readable "last checked N ago" or "never" for settings UI.
+    var lastCheckDescription: String {
+        guard let date = lastCheckDate else { return "Never" }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return formatter.localizedString(for: date, relativeTo: Date())
     }
 
     // MARK: - Check for Update
@@ -244,14 +272,20 @@ class UpdateChecker: ObservableObject {
 
     // MARK: - Notifications
 
+    /// Request notification authorization before posting. Silently no-op
+    /// if the user denies — the Settings "Updates" section still shows
+    /// the update in-app, so permission is not load-bearing.
     private func sendUpdateNotification(version: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "InstaArchive Update Available"
-        content.body = "Version \(version) is available. Open InstaArchive to update."
-        content.sound = .default
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { _, _ in
+            let content = UNMutableNotificationContent()
+            content.title = "InstaArchive Update Available"
+            content.body = "Version \(version) is available. Open InstaArchive to update."
+            content.sound = .default
 
-        let request = UNNotificationRequest(identifier: "update-available", content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+            let request = UNNotificationRequest(identifier: "update-available", content: content, trigger: nil)
+            center.add(request)
+        }
     }
 
     private func sendDownloadCompleteNotification(path: String, version: String) {

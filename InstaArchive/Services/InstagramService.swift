@@ -67,23 +67,18 @@ class InstagramService {
     /// ensures we always get the full-res image, not a thumbnail.
     private func bestImageURL(from candidates: [[String: Any]]) -> String? {
         let sorted = candidates.sorted { candidateScore($0) > candidateScore($1) }
-        if let best = sorted.first, let url = best["url"] as? String {
-            let w = numericValue(best["width"])
-            let h = numericValue(best["height"])
+        guard let best = sorted.first, let url = best["url"] as? String else { return nil }
+        let w = numericValue(best["width"])
+        let h = numericValue(best["height"])
+        // Only build the per-candidate widths array for diagnostics on
+        // low-res outliers — it's noise on the happy path and allocates
+        // a throwaway array per image otherwise.
+        if w < 500 {
             let smallest = sorted.last.flatMap { numericValue($0["width"]) } ?? 0
             let allWidths = sorted.map { numericValue($0["width"]) }
-            // Track max candidate width for strategy fallback decisions
-            if w > lastMaxCandidateWidth { lastMaxCandidateWidth = w }
-            if w < 500 {
-                log.warn("bestImageURL: picked \(w)x\(h) — only \(candidates.count) candidates (widths: \(allWidths)), smallest=\(smallest)px. URL prefix: \(String(url.prefix(80)))", context: "resolution")
-            } else if w >= 1080 {
-                log.info("bestImageURL: picked \(w)x\(h) from \(candidates.count) candidates (widths: \(allWidths))", context: "resolution")
-            } else {
-                log.info("bestImageURL: picked \(w)x\(h) — \(candidates.count) candidates (widths: \(allWidths)), best < 1080", context: "resolution")
-            }
-            return url
+            log.warn("bestImageURL: picked \(w)x\(h) — only \(candidates.count) candidates (widths: \(allWidths)), smallest=\(smallest)px. URL prefix: \(String(url.prefix(80)))", context: "resolution")
         }
-        return nil
+        return url
     }
 
     private func numericValue(_ value: Any?) -> Int {
@@ -173,19 +168,17 @@ class InstagramService {
     private var sessionInitialized = false
     private var cachedUserIds: [String: String] = [:]
 
-    /// Tracks the widest candidate width seen in the most recent parsing pass.
-    /// Used to detect when the v1 API returns degraded/low-res candidates so
-    /// we can fall through to GraphQL which typically has display_url at 1080px+.
-    private var lastMaxCandidateWidth: Int = 0
-
-    /// Whether CDN URL upgrades (removing size constraints from `stp` param)
-    /// work for this session.  nil = untested, true = works, false = broken.
-    private var cdnUpgradeVerified: Bool? = nil
-
-    /// Cache of shortcode → media PK populated during v1 feed parsing.
-    /// Enables per-post `/api/v1/media/{pk}/info/` fetching as a fallback
-    /// if CDN URL upgrades stop working in the future.
-    private var mediaPKCache: [String: String] = [:]
+    /// Whether CDN URL upgrades (stripping size constraints from the `stp`
+    /// query param) work for this session. Three states:
+    /// - `.untested`: no upgrade attempt has succeeded or failed yet
+    /// - `.works`: at least one upgrade succeeded — use upgrades for all images
+    /// - `.broken`: upgrades fail consistently — skip the upgrade path
+    /// Failures are counted before latching `.broken` so a single transient
+    /// network error doesn't permanently disable upgrades for the session.
+    private enum CDNUpgradeState { case untested, works, broken }
+    private var cdnUpgradeState: CDNUpgradeState = .untested
+    private var cdnUpgradeFailureCount: Int = 0
+    private let cdnUpgradeFailureThreshold = 3
 
     private init() {
         let config = URLSessionConfiguration.default
@@ -225,7 +218,7 @@ class InstagramService {
                 csrfToken = generateCSRFToken()
             }
             sessionInitialized = true
-            print("[InstaArchive] Session initialized from existing login cookies (authenticated, claim=\(igWWWClaim != "0" ? "yes" : "no"))")
+            log.info("Session initialized from existing login cookies (authenticated, claim=\(igWWWClaim != "0" ? "yes" : "no"))", context: "session")
             return
         }
 
@@ -287,7 +280,7 @@ class InstagramService {
             }
 
             sessionInitialized = true
-            print("[InstaArchive] Session initialized, CSRF: \(csrfToken != nil ? "yes" : "no"), authenticated: \(isAuthenticated), claim: \(igWWWClaim != "0" ? "yes" : "no")")
+            log.info("Session initialized, CSRF: \(csrfToken != nil ? "yes" : "no"), authenticated: \(isAuthenticated), claim: \(igWWWClaim != "0" ? "yes" : "no")", context: "session")
         } catch {
             log.error("Session init failed: \(error.localizedDescription)", context: "session")
             throw InstagramError.sessionError
@@ -847,7 +840,6 @@ class InstagramService {
 
         workingStrategy = nil
         paginationDepth = 0
-        lastMaxCandidateWidth = 0
         var allMedia: [DiscoveredMedia] = []
         var cursor: String? = nil
         var hasMore = true
@@ -859,12 +851,12 @@ class InstagramService {
             do {
                 result = try await fetchRecentMedia(username: username, after: cursor)
             } catch {
-                print("[InstaArchive] fetchRecentMedia failed on page \(allMedia.count / 33 + 1): \(error)")
+                log.warn("fetchRecentMedia failed on page \(allMedia.count / 33 + 1): \(error.localizedDescription)", context: "media")
                 break
             }
 
             if result.media.isEmpty {
-                print("[InstaArchive] Got empty page, stopping pagination")
+                log.info("Got empty page, stopping pagination", context: "media")
                 break
             }
 
@@ -886,7 +878,7 @@ class InstagramService {
             if newOnThisPage > 0 && knownOnThisPage == newOnThisPage && !knownIds.isEmpty {
                 pagesWithAllKnown += 1
                 if pagesWithAllKnown >= 2 {
-                    print("[InstaArchive] Two consecutive pages of known items, stopping")
+                    log.info("Two consecutive pages of known items, stopping", context: "media")
                     break
                 }
             } else {
@@ -901,14 +893,14 @@ class InstagramService {
             cursor = result.nextCursor
 
             if allMedia.count > 5000 {
-                print("[InstaArchive] Hit safety cap of 5000 items for @\(username)")
+                log.warn("Hit safety cap of 5000 items for @\(username)", context: "media")
                 break
             }
 
-            print("[InstaArchive] Page complete: \(newOnThisPage) items, total so far: \(allMedia.count), hasMore: \(hasMore)")
+            log.info("Page complete: \(newOnThisPage) items, total \(allMedia.count), hasMore: \(hasMore)", context: "media")
         }
 
-        print("[InstaArchive] Fetched \(allMedia.count) total media items for @\(username) via \(workingStrategy ?? "unknown")")
+        log.info("Fetched \(allMedia.count) total media items for @\(username) via \(workingStrategy ?? "unknown")", context: "media")
         return allMedia
     }
 
@@ -921,10 +913,9 @@ class InstagramService {
         if let strategy = workingStrategy {
             switch strategy {
             case "v1":
-                lastMaxCandidateWidth = 0
                 if let result = try? await fetchMediaViaAPI(username: username, cursor: cursor),
                    !result.media.isEmpty {
-                    log.info("v1 API page: \(result.media.count) items (max \(lastMaxCandidateWidth)px, CDN upgrade handles res)", context: "media")
+                    log.info("v1 API page: \(result.media.count) items", context: "media")
                     return result
                 }
             case "graphql":
@@ -941,17 +932,13 @@ class InstagramService {
         }
 
         // Strategy 1: v1 API
-        // NOTE: We ALWAYS accept v1 results regardless of candidate resolution.
-        // The v1 feed API intentionally returns reduced candidates (150/480px)
-        // as a bandwidth optimisation — this is normal Instagram behaviour, not
-        // a session problem. The CDN URL upgrade in downloadMediaData() rewrites
-        // these URLs at download time to request original resolution.
-        lastMaxCandidateWidth = 0
+        // v1 returns reduced 150/480px candidates by design; downloadMediaData()
+        // upgrades CDN URLs at fetch time, so we always accept v1 results.
         do {
             let result = try await fetchMediaViaAPI(username: username, cursor: cursor)
             if !result.media.isEmpty {
                 workingStrategy = "v1"
-                log.info("v1 API: \(result.media.count) items for @\(username) (max \(lastMaxCandidateWidth)px, CDN upgrade handles res)", context: "media")
+                log.info("v1 API: \(result.media.count) items for @\(username)", context: "media")
                 return result
             } else {
                 log.info("v1 API: 0 items for @\(username)", context: "media")
@@ -961,12 +948,11 @@ class InstagramService {
         }
 
         // Strategy 2: GraphQL
-        lastMaxCandidateWidth = 0
         do {
             let result = try await fetchMediaViaGraphQL(username: username, cursor: cursor)
             if !result.media.isEmpty {
                 workingStrategy = "graphql"
-                log.info("GraphQL: \(result.media.count) items for @\(username) (max \(lastMaxCandidateWidth)px)", context: "media")
+                log.info("GraphQL: \(result.media.count) items for @\(username)", context: "media")
                 return result
             } else {
                 log.info("GraphQL: 0 items for @\(username)", context: "media")
@@ -1020,7 +1006,7 @@ class InstagramService {
         let (data, response) = try await session.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            print("[InstaArchive] Stories API returned status \((response as? HTTPURLResponse)?.statusCode ?? 0) for @\(username)")
+            log.warn("Stories API returned status \((response as? HTTPURLResponse)?.statusCode ?? 0) for @\(username)", context: "stories")
             // Try GraphQL fallback
             return try await fetchStoriesViaGraphQL(userId: userId, username: username)
         }
@@ -1141,7 +1127,7 @@ class InstagramService {
             ))
         }
 
-        print("[InstaArchive] Found \(media.count) stories for @\(username)")
+        log.info("Found \(media.count) stories for @\(username)", context: "stories")
         return media
     }
 
@@ -1156,11 +1142,11 @@ class InstagramService {
         let highlightIds = try await fetchHighlightReelIds(userId: userId)
 
         guard !highlightIds.isEmpty else {
-            print("[InstaArchive] No highlights found for @\(username)")
+            log.info("No highlights found for @\(username)", context: "highlights")
             return []
         }
 
-        print("[InstaArchive] Found \(highlightIds.count) highlight reels for @\(username)")
+        log.info("Found \(highlightIds.count) highlight reels for @\(username)", context: "highlights")
 
         // Step 2: Fetch items from each highlight reel
         var allMedia: [DiscoveredMedia] = []
@@ -1169,7 +1155,7 @@ class InstagramService {
             allMedia.append(contentsOf: items)
         }
 
-        print("[InstaArchive] Fetched \(allMedia.count) total highlight items for @\(username)")
+        log.info("Fetched \(allMedia.count) total highlight items for @\(username)", context: "highlights")
         return allMedia
     }
 
@@ -1391,7 +1377,7 @@ class InstagramService {
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            print("[InstaArchive] Feed API returned status \(statusCode)")
+            log.warn("Feed API returned status \(statusCode) for @\(username)", context: "api")
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
@@ -1414,13 +1400,6 @@ class InstagramService {
             let mediaType = item["media_type"] as? Int ?? 1
             let isVideo = mediaType == 2
             let timestamp = item["taken_at"] as? TimeInterval ?? Date().timeIntervalSince1970
-
-            // Cache media PK for potential per-post full-res fetching
-            if !code.isEmpty {
-                if let pk = item["pk"] as? Int64 { mediaPKCache[code] = String(pk) }
-                else if let pk = item["pk"] as? String { mediaPKCache[code] = pk }
-                else if let pk = item["pk"] as? Int { mediaPKCache[code] = String(pk) }
-            }
 
             let caption = (item["caption"] as? [String: Any])?["text"] as? String
 
@@ -1666,7 +1645,7 @@ class InstagramService {
         if let embeddedMedia = extractEmbeddedMediaData(from: html) {
             discoveredMedia.append(contentsOf: embeddedMedia)
             foundShortcodes = Set(embeddedMedia.map { $0.instagramId })
-            print("[InstaArchive] Extracted \(embeddedMedia.count) items from embedded JSON")
+            log.info("Extracted \(embeddedMedia.count) items from embedded JSON", context: "scrape")
         }
 
         // 2. Find shortcodes from HTML and try to get their data inline
@@ -1726,7 +1705,7 @@ class InstagramService {
         let missingShortcodes = foundShortcodes.subtracting(shortcodesWithMedia)
 
         if !missingShortcodes.isEmpty {
-            print("[InstaArchive] Fetching \(missingShortcodes.count) individual posts by shortcode")
+            log.info("Fetching \(missingShortcodes.count) individual posts by shortcode", context: "scrape")
             for shortcode in missingShortcodes {
                 if let media = try? await fetchSinglePost(shortcode: shortcode) {
                     discoveredMedia.append(media)
@@ -1734,7 +1713,7 @@ class InstagramService {
             }
         }
 
-        print("[InstaArchive] Profile page total: \(discoveredMedia.count) items from \(foundShortcodes.count) shortcodes")
+        log.info("Profile page total: \(discoveredMedia.count) items from \(foundShortcodes.count) shortcodes", context: "scrape")
         return (discoveredMedia, nil, false)
     }
 
@@ -1863,7 +1842,7 @@ class InstagramService {
                 }
             }
         } catch {
-            print("[InstaArchive] v1 media info failed for \(shortcode): \(error.localizedDescription)")
+            log.warn("v1 media info failed for \(shortcode): \(error.localizedDescription)", context: "api")
         }
 
         // Fallback: try the post page HTML
@@ -2089,6 +2068,13 @@ class InstagramService {
 
     // MARK: - CDN URL Resolution Upgrade
 
+    /// Compiled once per process. Matches `_p480x480` (proportional resize) and
+    /// `_s150x150` (square crop) directives inside the `stp` query parameter.
+    private static let stpSizeDirectivePattern: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        return try! NSRegularExpression(pattern: "_[ps]\\d+x\\d+")
+    }()
+
     /// Upgrade an Instagram CDN image URL to request original/full resolution
     /// by removing size-limiting transform parameters.
     ///
@@ -2099,36 +2085,31 @@ class InstagramService {
     /// original resolution. Crucially, `stp` is NOT part of the `oh`/`oe` URL
     /// signature, so modifying it does not break the signed URL.
     private func upgradeImageURL(_ urlString: String) -> String {
+        // Fast path: avoid URLComponents parsing for URLs that can't be upgraded.
+        guard urlString.contains("stp=") else { return urlString }
         guard var components = URLComponents(string: urlString),
               let host = components.host,
               host.contains("cdninstagram.com") || host.contains("fbcdn.net") else {
-            return urlString   // Not an Instagram CDN URL
+            return urlString
         }
-
         guard var queryItems = components.queryItems else { return urlString }
 
         var modified = false
         for (index, item) in queryItems.enumerated() where item.name == "stp" {
-            if let value = item.value {
-                // Remove proportional-resize (_p480x480) and square-crop (_s150x150) directives.
-                // Keep format/encoding prefix (dst-jpg_e35).
-                let cleaned = value.replacingOccurrences(
-                    of: "_[ps]\\d+x\\d+",
-                    with: "",
-                    options: .regularExpression
-                )
-                if cleaned != value {
-                    queryItems[index] = URLQueryItem(name: "stp", value: cleaned)
-                    modified = true
-                }
+            guard let value = item.value else { continue }
+            let range = NSRange(value.startIndex..<value.endIndex, in: value)
+            let cleaned = Self.stpSizeDirectivePattern.stringByReplacingMatches(
+                in: value, range: range, withTemplate: ""
+            )
+            if cleaned != value {
+                queryItems[index] = URLQueryItem(name: "stp", value: cleaned)
+                modified = true
             }
         }
 
-        if modified {
-            components.queryItems = queryItems
-            return components.url?.absoluteString ?? urlString
-        }
-        return urlString
+        guard modified else { return urlString }
+        components.queryItems = queryItems
+        return components.url?.absoluteString ?? urlString
     }
 
     // MARK: - Download Media File
@@ -2137,21 +2118,29 @@ class InstagramService {
         // No rate limiting for CDN downloads — these are pre-signed URLs
         // that don't count against Instagram's API rate limit.
 
-        // Try CDN URL upgrade for full resolution (remove size constraints)
-        if cdnUpgradeVerified != false {
+        // Try CDN URL upgrade for full resolution, unless the latch says it's broken.
+        if cdnUpgradeState != .broken {
             let upgraded = upgradeImageURL(urlString)
             if upgraded != urlString {
                 do {
                     let data = try await performCDNDownload(from: upgraded)
-                    if cdnUpgradeVerified == nil {
-                        cdnUpgradeVerified = true
+                    if cdnUpgradeState != .works {
+                        cdnUpgradeState = .works
+                        cdnUpgradeFailureCount = 0
                         log.info("CDN URL upgrade works — downloading original-resolution images", context: "resolution")
                     }
                     return data
                 } catch {
-                    if cdnUpgradeVerified == nil {
-                        cdnUpgradeVerified = false
-                        log.warn("CDN URL upgrade rejected (\(error.localizedDescription)) — using API-provided URLs as-is", context: "resolution")
+                    // Only latch to `.broken` after repeated failures — a single
+                    // transient network error shouldn't permanently disable
+                    // upgrades for the whole session. Once we've seen `.works`
+                    // at least once, we never latch off.
+                    if cdnUpgradeState == .untested {
+                        cdnUpgradeFailureCount += 1
+                        if cdnUpgradeFailureCount >= cdnUpgradeFailureThreshold {
+                            cdnUpgradeState = .broken
+                            log.warn("CDN URL upgrade rejected \(cdnUpgradeFailureCount)× — using API-provided URLs as-is", context: "resolution")
+                        }
                     }
                     // Fall through to original URL
                 }

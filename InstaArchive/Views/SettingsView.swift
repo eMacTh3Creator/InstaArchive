@@ -7,6 +7,7 @@ struct SettingsView: View {
     @EnvironmentObject var profileStore: ProfileStore
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var webServer = WebServer.shared
+    @ObservedObject private var updater = UpdateChecker.shared
     @State private var showingFolderPicker = false
     @State private var showingLogin = false
 
@@ -176,6 +177,11 @@ struct SettingsView: View {
                         .controlSize(.small)
                     }
 
+                    // Updates
+                    settingsSection("Updates") {
+                        updatesSection
+                    }
+
                     // Web Interface
                     settingsSection("Web Interface") {
                         VStack(alignment: .leading, spacing: 8) {
@@ -247,7 +253,7 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .frame(width: 520, height: 780)
+        .frame(width: 520, height: 820)
         .sheet(isPresented: $showingLogin) {
             InstagramLoginView()
         }
@@ -260,6 +266,101 @@ struct SettingsView: View {
                 .foregroundColor(.primary)
             content()
         }
+    }
+
+    // MARK: - Updates section
+
+    @ViewBuilder
+    private var updatesSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Current version row with Check Now
+            HStack(spacing: 8) {
+                Image(systemName: "app.badge")
+                    .foregroundColor(.accentColor)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("InstaArchive \(updater.currentVersion)")
+                        .font(.system(size: 13, weight: .medium))
+                    Text(updateStatusLine)
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+                Spacer()
+                if updater.isChecking {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 16, height: 16)
+                }
+                Button("Check Now") {
+                    Task { await updater.checkForUpdate() }
+                }
+                .controlSize(.small)
+                .disabled(updater.isChecking || updater.isDownloading)
+            }
+            .padding(10)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .cornerRadius(8)
+
+            // Update-available banner
+            if updater.updateAvailable, let latest = updater.latestVersion {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.down.circle.fill")
+                            .foregroundColor(.accentColor)
+                        Text("Version \(latest) is available")
+                            .font(.system(size: 12, weight: .medium))
+                        Spacer()
+                        if updater.isDownloading {
+                            ProgressView(value: updater.downloadProgress)
+                                .frame(width: 80)
+                        } else {
+                            Button("Download") {
+                                Task { await updater.downloadUpdate() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            Button("Skip") {
+                                updater.skipVersion(latest)
+                            }
+                            .controlSize(.small)
+                        }
+                    }
+                }
+                .padding(10)
+                .background(Color.accentColor.opacity(0.08))
+                .cornerRadius(8)
+            }
+
+            // Auto-update toggle + schedule
+            Toggle("Check for updates automatically", isOn: $updater.autoUpdateEnabled)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+
+            HStack {
+                Text("Check for updates")
+                Picker("", selection: $updater.checkInterval) {
+                    Text("Manually").tag("manual")
+                    Text("Daily").tag("daily")
+                    Text("Weekly").tag("weekly")
+                }
+                .frame(width: 140)
+                .disabled(!updater.autoUpdateEnabled)
+            }
+
+            Text("Updates download to your Downloads folder. After downloading, quit InstaArchive, replace the app in Applications, and relaunch.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private var updateStatusLine: String {
+        if updater.isChecking {
+            return "Checking for updates…"
+        }
+        if updater.updateAvailable, let latest = updater.latestVersion {
+            return "Update available: \(latest)"
+        }
+        return "Last checked \(updater.lastCheckDescription)"
     }
 
     private func chooseFolder() {
