@@ -295,13 +295,11 @@ class InstagramService {
     func resetSession() {
         sessionInitialized = false
         csrfToken = nil
-        // Only clear non-session cookies so the user doesn't have to log in again.
-        // Preserving sessionid allows re-initialization without a manual re-login.
-        if let cookies = HTTPCookieStorage.shared.cookies {
-            for cookie in cookies where cookie.domain.contains("instagram.com") && cookie.name != "sessionid" {
-                HTTPCookieStorage.shared.deleteCookie(cookie)
-            }
-        }
+        // Soft reset only. Explicit logout already clears all Instagram cookies.
+        // Preserving the full cookie jar keeps Instagram's device-recognition
+        // cookies stable so the next request is less likely to look like a
+        // completely new "Mac OS X PC" login.
+        igWWWClaim = "0"
     }
 
     // MARK: - Rate Limiting
@@ -2075,6 +2073,14 @@ class InstagramService {
         return try! NSRegularExpression(pattern: "_[ps]\\d+x\\d+")
     }()
 
+    /// Matches the raw `stp=` query parameter value without reparsing the entire
+    /// URL. Rebuilding these signed CDN URLs with URLComponents can re-encode
+    /// unrelated query items and trigger 403 responses from Instagram.
+    private static let stpQueryValuePattern: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        return try! NSRegularExpression(pattern: "([?&]stp=)([^&#]+)")
+    }()
+
     /// Upgrade an Instagram CDN image URL to request original/full resolution
     /// by removing size-limiting transform parameters.
     ///
@@ -2082,34 +2088,36 @@ class InstagramService {
     /// processing: e.g. `stp=dst-jpg_e35_p480x480` means "JPEG, quality e35, cap at
     /// 480×480". The `_p{W}x{H}` suffix is a resize directive. Removing it while
     /// keeping the format/encoding (`dst-jpg_e35`) instructs the CDN to serve the
-    /// original resolution. Crucially, `stp` is NOT part of the `oh`/`oe` URL
-    /// signature, so modifying it does not break the signed URL.
+    /// original resolution. Crucially, this must be done as an in-place string
+    /// edit. Rebuilding the entire query string can re-encode signed parameters
+    /// and make Instagram reject the URL with HTTP 403.
     private func upgradeImageURL(_ urlString: String) -> String {
-        // Fast path: avoid URLComponents parsing for URLs that can't be upgraded.
         guard urlString.contains("stp=") else { return urlString }
-        guard var components = URLComponents(string: urlString),
-              let host = components.host,
+        guard let url = URL(string: urlString),
+              let host = url.host,
               host.contains("cdninstagram.com") || host.contains("fbcdn.net") else {
             return urlString
         }
-        guard var queryItems = components.queryItems else { return urlString }
 
-        var modified = false
-        for (index, item) in queryItems.enumerated() where item.name == "stp" {
-            guard let value = item.value else { continue }
-            let range = NSRange(value.startIndex..<value.endIndex, in: value)
-            let cleaned = Self.stpSizeDirectivePattern.stringByReplacingMatches(
-                in: value, range: range, withTemplate: ""
-            )
-            if cleaned != value {
-                queryItems[index] = URLQueryItem(name: "stp", value: cleaned)
-                modified = true
-            }
+        let fullRange = NSRange(urlString.startIndex..<urlString.endIndex, in: urlString)
+        guard let match = Self.stpQueryValuePattern.firstMatch(in: urlString, range: fullRange),
+              let valueRange = Range(match.range(at: 2), in: urlString) else {
+            return urlString
         }
 
-        guard modified else { return urlString }
-        components.queryItems = queryItems
-        return components.url?.absoluteString ?? urlString
+        let originalValue = String(urlString[valueRange])
+        let innerRange = NSRange(originalValue.startIndex..<originalValue.endIndex, in: originalValue)
+        let cleanedValue = Self.stpSizeDirectivePattern.stringByReplacingMatches(
+            in: originalValue,
+            range: innerRange,
+            withTemplate: ""
+        )
+
+        guard cleanedValue != originalValue else { return urlString }
+
+        var upgraded = urlString
+        upgraded.replaceSubrange(valueRange, with: cleanedValue)
+        return upgraded
     }
 
     // MARK: - Download Media File

@@ -65,6 +65,8 @@ class SessionError(InstagramError):
 
 BASE_URL = "https://www.instagram.com"
 APP_ID   = "936619743392459"
+STP_SIZE_DIRECTIVE_RE = re.compile(r"_[ps]\d+x\d+")
+STP_QUERY_VALUE_RE = re.compile(r"([?&]stp=)([^&#]+)")
 
 # NOTE: Do NOT set Accept-Encoding here. The requests library handles
 # gzip/deflate/br decompression automatically; setting it manually can
@@ -155,13 +157,12 @@ class InstagramService:
     def reset_session(self):
         self._session_ready = False
         self._csrf_token = None
-        # Preserve sessionid so the user doesn't have to log in again
-        saved_session_id = self._session.cookies.get("sessionid", domain=".instagram.com")
-        self._session.cookies.clear()
-        if saved_session_id:
-            self._session.cookies.set("sessionid", saved_session_id, domain=".instagram.com")
+        # Soft reset only. Explicit logout should clear cookies.
+        # Preserving Instagram's full cookie jar helps keep device-recognition
+        # state stable so the next request is less likely to look like a fresh
+        # "Windows PC" login.
         self._settings.is_logged_in = False
-        self._log.info("Session reset (sessionid preserved)", context="session")
+        self._log.info("Session reset (cookies preserved)", context="session")
 
     # ------------------------------------------------------------------
     # Rate limiting
@@ -834,9 +835,21 @@ class InstagramService:
     # ------------------------------------------------------------------
 
     def download_media_data(self, url: str) -> bytes:
+        upgraded = self._upgrade_image_url(url)
+        if upgraded != url:
+            try:
+                return self._perform_cdn_download(upgraded)
+            except Exception as e:
+                self._log.warn(f"CDN upgrade failed, retrying original URL: {e}", context="download")
+        return self._perform_cdn_download(url)
+
+    def _perform_cdn_download(self, url: str) -> bytes:
         resp = self._session.get(
             url,
-            headers={"Referer": "https://www.instagram.com/"},
+            headers={
+                "Referer": "https://www.instagram.com/",
+                "Accept": "image/jpeg,video/mp4,image/*;q=0.9,*/*;q=0.5",
+            },
             timeout=60,
             stream=False,
         )
@@ -845,3 +858,21 @@ class InstagramService:
         if len(resp.content) < 100:
             raise InstagramError("Downloaded file suspiciously small")
         return resp.content
+
+    def _upgrade_image_url(self, url: str) -> str:
+        if "stp=" not in url:
+            return url
+        if "cdninstagram.com" not in url and "fbcdn.net" not in url:
+            return url
+
+        match = STP_QUERY_VALUE_RE.search(url)
+        if not match:
+            return url
+
+        original = match.group(2)
+        cleaned = STP_SIZE_DIRECTIVE_RE.sub("", original)
+        if cleaned == original:
+            return url
+
+        start, end = match.span(2)
+        return url[:start] + cleaned + url[end:]
