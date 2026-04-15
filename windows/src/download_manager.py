@@ -382,25 +382,41 @@ class DownloadManager:
                     item_id = f"{media.instagram_id}_{idx}" if len(media.media_urls) > 1 else media.instagram_id
                     if self._is_downloaded(item_id):
                         continue
-                    save_path = self._storage.save_path(
-                        username, media.media_type, media.instagram_id,
-                        media.timestamp, media.is_video, idx, len(media.media_urls)
+                    existing_path = self._storage.existing_save_path(
+                        username,
+                        media.media_type,
+                        media.instagram_id,
+                        media.timestamp,
+                        media.is_video,
+                        idx,
+                        len(media.media_urls),
+                        media_url=url,
                     )
                     # If already on disk, just re-index
-                    if save_path.exists():
-                        size = save_path.stat().st_size
+                    if existing_path is not None:
+                        size = existing_path.stat().st_size
                         self._record_download(MediaItem(
                             profile_username=username,
                             media_type=media.media_type,
                             instagram_id=item_id,
                             media_url=url,
-                            local_path=str(save_path),
+                            local_path=str(existing_path),
                             caption=media.caption,
                             timestamp=media.timestamp.isoformat(),
                             downloaded_at=datetime.now().isoformat(),
                             file_size=size,
                         ))
                         continue
+                    save_path = self._storage.save_path(
+                        username,
+                        media.media_type,
+                        media.instagram_id,
+                        media.timestamp,
+                        media.is_video,
+                        idx,
+                        len(media.media_urls),
+                        media_url=url,
+                    )
                     jobs.append({
                         "media": media, "idx": idx, "url": url,
                         "item_id": item_id, "save_path": save_path,
@@ -420,13 +436,28 @@ class DownloadManager:
                     return
                 try:
                     data = self._instagram.download_media_data(job["url"])
-                    self._storage.save_file(data, job["save_path"])
+                    final_ext = self._storage.detected_extension(
+                        data,
+                        job["url"],
+                        job["media"].is_video,
+                    )
+                    final_save_path = self._storage.save_path(
+                        username,
+                        job["media"].media_type,
+                        job["media"].instagram_id,
+                        job["media"].timestamp,
+                        job["media"].is_video,
+                        job["idx"],
+                        len(job["media"].media_urls),
+                        file_ext=final_ext,
+                    )
+                    self._storage.save_file(data, final_save_path)
                     item = MediaItem(
                         profile_username=username,
                         media_type=job["media"].media_type,
                         instagram_id=job["item_id"],
                         media_url=job["url"],
-                        local_path=str(job["save_path"]),
+                        local_path=str(final_save_path),
                         caption=job["media"].caption,
                         timestamp=job["media"].timestamp.isoformat(),
                         downloaded_at=datetime.now().isoformat(),

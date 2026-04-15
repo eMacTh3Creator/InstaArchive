@@ -1,5 +1,11 @@
 import Foundation
 import Network
+import AppKit
+
+extension Notification.Name {
+    static let webServerOpenInstagramLogin = Notification.Name("WebServerOpenInstagramLogin")
+    static let webServerOpenSettings = Notification.Name("WebServerOpenSettings")
+}
 
 /// Lightweight HTTP server for managing subscriptions from a browser.
 /// Runs on localhost:8485 by default.
@@ -239,6 +245,14 @@ class WebServer: ObservableObject {
             handleGetProfileDetail(username: username, connection: connection)
         case ("GET", "/api/status"):
             handleGetStatus(connection: connection)
+        case ("GET", "/api/settings"):
+            handleGetSettings(connection: connection)
+        case ("POST", "/api/settings"):
+            handleUpdateSettings(body: body, connection: connection)
+        case ("POST", "/api/client/open-login"):
+            handleOpenClientLogin(connection: connection)
+        case ("POST", "/api/client/open-settings"):
+            handleOpenClientSettings(connection: connection)
         case ("POST", "/api/sync/all"):
             handleSyncAll(connection: connection)
         case ("POST", _) where path.hasPrefix("/api/refresh/"):
@@ -458,9 +472,120 @@ class WebServer: ObservableObject {
             "totalProfiles": profiles.count,
             "activeProfiles": profiles.filter({ $0.isActive }).count,
             "totalMediaIndexed": dm.totalDownloaded,
-            "currentActivity": dm.currentActivity
+            "currentActivity": dm.currentActivity,
+            "instagramLoggedIn": AppSettings.shared.isLoggedIn,
+            "canOpenLocalLogin": true
         ]
         self.sendJSON(connection: connection, json: json)
+    }
+
+    private func handleGetSettings(connection: NWConnection) {
+        let settings = AppSettings.shared
+        let json: [String: Any] = [
+            "download_path": settings.downloadPath,
+            "check_interval_hours": settings.checkIntervalHours,
+            "download_posts": settings.downloadPosts,
+            "download_reels": settings.downloadReels,
+            "download_videos": settings.downloadVideos,
+            "download_highlights": settings.downloadHighlights,
+            "download_stories": settings.downloadStories,
+            "max_concurrent_profiles": settings.maxConcurrentDownloads,
+            "max_concurrent_files": settings.maxConcurrentFileDownloads,
+            "notifications_enabled": settings.notificationsEnabled,
+            "web_server_password": settings.webServerPassword
+        ]
+        sendJSON(connection: connection, json: json)
+    }
+
+    private func handleUpdateSettings(body: String?, connection: NWConnection) {
+        guard let body = body,
+              let data = body.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else {
+            sendJSON(connection: connection, status: "400 Bad Request", json: ["error": "Invalid settings payload"])
+            return
+        }
+
+        let applyUpdates = {
+            let settings = AppSettings.shared
+
+            if let downloadPath = json["download_path"] as? String {
+                let cleaned = downloadPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !cleaned.isEmpty {
+                    settings.downloadPath = cleaned
+                    StorageManager.shared.ensureDirectoryExists(URL(fileURLWithPath: cleaned))
+                }
+            }
+
+            if let checkInterval = json["check_interval_hours"] as? Int {
+                settings.checkIntervalHours = max(1, min(checkInterval, 720))
+            }
+            if let enabled = json["download_posts"] as? Bool {
+                settings.downloadPosts = enabled
+            }
+            if let enabled = json["download_reels"] as? Bool {
+                settings.downloadReels = enabled
+            }
+            if let enabled = json["download_videos"] as? Bool {
+                settings.downloadVideos = enabled
+            }
+            if let enabled = json["download_highlights"] as? Bool {
+                settings.downloadHighlights = enabled
+            }
+            if let enabled = json["download_stories"] as? Bool {
+                settings.downloadStories = enabled
+            }
+            if let concurrency = json["max_concurrent_profiles"] as? Int {
+                settings.maxConcurrentDownloads = max(1, min(concurrency, 12))
+            }
+            if let concurrency = json["max_concurrent_files"] as? Int {
+                settings.maxConcurrentFileDownloads = max(1, min(concurrency, 24))
+            }
+            if let enabled = json["notifications_enabled"] as? Bool {
+                settings.notificationsEnabled = enabled
+            }
+            if let password = json["web_server_password"] as? String {
+                settings.webServerPassword = password
+            }
+        }
+
+        if Thread.isMainThread {
+            applyUpdates()
+        } else {
+            DispatchQueue.main.sync(execute: applyUpdates)
+        }
+
+        sendJSON(connection: connection, json: ["success": true, "message": "Settings updated"])
+    }
+
+    private func handleOpenClientLogin(connection: NWConnection) {
+        DispatchQueue.main.async {
+            if let window = NSApplication.shared.windows.first(where: { $0.canBecomeMain }) {
+                window.makeKeyAndOrderFront(nil)
+            }
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            NotificationCenter.default.post(name: .webServerOpenInstagramLogin, object: nil)
+        }
+
+        sendJSON(connection: connection, json: [
+            "success": true,
+            "message": "Opened Instagram login on this Mac"
+        ])
+    }
+
+    private func handleOpenClientSettings(connection: NWConnection) {
+        DispatchQueue.main.async {
+            if let window = NSApplication.shared.windows.first(where: { $0.canBecomeMain }) {
+                window.makeKeyAndOrderFront(nil)
+            }
+            NSApplication.shared.activate(ignoringOtherApps: true)
+            NotificationCenter.default.post(name: .webServerOpenSettings, object: nil)
+        }
+
+        sendJSON(connection: connection, json: [
+            "success": true,
+            "message": "Opened InstaArchive settings on this Mac"
+        ])
     }
 
     // MARK: - Sync Handlers
@@ -634,10 +759,15 @@ class WebServer: ObservableObject {
       .container { max-width: 640px; margin: 0 auto; padding: 40px 20px; }
       h1 { font-size: 24px; font-weight: 600; margin-bottom: 4px; }
       .subtitle { color: var(--sub); font-size: 14px; margin-bottom: 32px; }
+      .header-actions { display: flex; gap: 10px; margin-bottom: 18px; flex-wrap: wrap; }
       .status-bar { display: flex; gap: 24px; margin-bottom: 28px; padding: 14px 18px; background: var(--card); border: 1px solid var(--border); border-radius: 10px; }
       .stat { display: flex; flex-direction: column; }
       .stat-val { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
       .stat-label { font-size: 11px; color: var(--sub); margin-top: 2px; text-transform: uppercase; letter-spacing: 0.5px; }
+      .session-banner { display: none; gap: 16px; align-items: center; justify-content: space-between; margin-bottom: 20px; padding: 16px 18px; background: #1c1105; border: 1px solid #4a2d07; border-radius: 12px; }
+      .session-title { font-size: 14px; font-weight: 600; margin-bottom: 3px; }
+      .session-copy { color: #d1b48c; font-size: 12px; line-height: 1.45; }
+      .session-actions { display: flex; gap: 10px; flex-wrap: wrap; }
       .add-form { display: flex; gap: 10px; margin-bottom: 28px; }
       .add-form input { flex: 1; padding: 10px 14px; border-radius: 8px; border: 1px solid var(--border); background: var(--card); color: var(--text); font-size: 14px; outline: none; transition: border-color 0.15s; }
       .add-form input:focus { border-color: var(--accent); }
@@ -673,6 +803,17 @@ class WebServer: ObservableObject {
       .empty { text-align: center; padding: 40px 20px; color: var(--sub); }
       #fileInput { display: none; }
       .loading { text-align: center; padding: 20px; color: var(--sub); }
+      .settings-panel { display: none; margin-bottom: 28px; padding: 18px; background: var(--card); border: 1px solid var(--border); border-radius: 12px; }
+      .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin-top: 16px; }
+      .field { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--sub); }
+      .field-wide { grid-column: 1 / -1; }
+      .field input { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 13px; outline: none; }
+      .field input:focus { border-color: var(--accent); }
+      .toggle-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; grid-column: 1 / -1; }
+      .check-field { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--border); background: var(--bg); font-size: 13px; color: var(--text); }
+      .check-field input { accent-color: var(--accent); }
+      .settings-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
+      .settings-note { font-size: 12px; color: var(--sub); }
 
       /* Profile detail panel */
       .detail-panel { display: none; }
@@ -702,12 +843,72 @@ class WebServer: ObservableObject {
       <div id="listView">
         <h1>InstaArchive</h1>
         <p class="subtitle">Manage your archived Instagram profiles</p>
+        <div class="header-actions">
+          <button class="btn btn-sm btn-outline" onclick="toggleSettings()">Settings</button>
+          <button class="btn btn-sm btn-outline" onclick="requestBrowserNotifications()">Enable Browser Alerts</button>
+          <button class="btn btn-sm btn-outline" id="openSettingsBtn" onclick="openClientSettings()" style="display:none">Open Settings in App</button>
+        </div>
+
+        <div class="session-banner" id="sessionBanner">
+          <div>
+            <div class="session-title">Instagram login needed</div>
+            <div class="session-copy">The local client was logged out or the session expired. Reconnect on this Mac to keep downloads running.</div>
+          </div>
+          <div class="session-actions">
+            <button class="btn btn-sm btn-primary" id="openLoginBtn" onclick="openClientLogin()">Open Login on This Mac</button>
+            <button class="btn btn-sm btn-outline" onclick="toggleSettings(true)">Review Settings</button>
+          </div>
+        </div>
 
         <div class="status-bar" id="statusBar">
           <div class="stat"><span class="stat-val" id="statProfiles">-</span><span class="stat-label">Profiles</span></div>
           <div class="stat"><span class="stat-val" id="statActive">-</span><span class="stat-label">Active</span></div>
           <div class="stat"><span class="stat-val" id="statMedia">-</span><span class="stat-label">Media</span></div>
           <div class="stat"><span class="stat-val" id="statStatus">-</span><span class="stat-label">Status</span></div>
+        </div>
+
+        <div class="settings-panel" id="settingsPanel">
+          <div class="section-head">
+            <h2>Client Settings</h2>
+            <div class="section-actions">
+              <button class="btn btn-sm btn-outline" onclick="requestBrowserNotifications()">Enable Alerts</button>
+              <button class="btn btn-sm btn-outline" onclick="toggleSettings(false)">Close</button>
+            </div>
+          </div>
+          <div class="settings-grid">
+            <label class="field field-wide">
+              <span>Download Folder</span>
+              <input type="text" id="settingsDownloadPath" spellcheck="false" />
+            </label>
+            <label class="field">
+              <span>Check Every (hours)</span>
+              <input type="number" id="settingsCheckInterval" min="1" max="720" />
+            </label>
+            <label class="field">
+              <span>Concurrent Profiles</span>
+              <input type="number" id="settingsConcurrentProfiles" min="1" max="12" />
+            </label>
+            <label class="field">
+              <span>Concurrent Files</span>
+              <input type="number" id="settingsConcurrentFiles" min="1" max="24" />
+            </label>
+            <label class="field field-wide">
+              <span>Web Password</span>
+              <input type="password" id="settingsWebPassword" />
+            </label>
+            <div class="toggle-grid">
+              <label class="check-field"><input type="checkbox" id="settingsDownloadPosts" /> <span>Posts</span></label>
+              <label class="check-field"><input type="checkbox" id="settingsDownloadReels" /> <span>Reels</span></label>
+              <label class="check-field"><input type="checkbox" id="settingsDownloadVideos" /> <span>Videos</span></label>
+              <label class="check-field"><input type="checkbox" id="settingsDownloadHighlights" /> <span>Highlights</span></label>
+              <label class="check-field"><input type="checkbox" id="settingsDownloadStories" /> <span>Stories</span></label>
+              <label class="check-field"><input type="checkbox" id="settingsNotificationsEnabled" /> <span>Desktop Notifications</span></label>
+            </div>
+          </div>
+          <div class="settings-actions">
+            <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+            <span class="settings-note">Changes apply to the local client right away.</span>
+          </div>
         </div>
 
         <form class="add-form" onsubmit="addProfile(event, true)">
@@ -765,14 +966,26 @@ class WebServer: ObservableObject {
     <script>
     let profiles = [];
     let currentDetail = null;
+    let lastInstagramLoggedIn = null;
+    let settingsLoaded = false;
 
     // ---- List view ----
 
+    async function apiRequest(url, options = {}) {
+      const res = await fetch(url, options);
+      if (res.status === 401) {
+        window.location.href = '/login';
+        throw new Error('Unauthorized');
+      }
+      let data = {};
+      try { data = await res.json(); } catch {}
+      return { res, data };
+    }
+
     async function loadProfiles() {
       try {
-        const res = await fetch('/api/profiles');
-        if (res.status === 401) { window.location.href = '/login'; return; }
-        profiles = await res.json();
+        const { data } = await apiRequest('/api/profiles');
+        profiles = data;
         renderProfiles();
       } catch (e) {
         document.getElementById('profilesList').innerHTML = '<div class="empty">Could not connect to InstaArchive</div>';
@@ -781,14 +994,127 @@ class WebServer: ObservableObject {
 
     async function loadStatus() {
       try {
-        const res = await fetch('/api/status');
-        if (res.status === 401) return;
-        const s = await res.json();
+        const { data: s } = await apiRequest('/api/status');
         document.getElementById('statProfiles').textContent = s.totalProfiles;
         document.getElementById('statActive').textContent = s.activeProfiles;
         document.getElementById('statMedia').textContent = s.totalMediaIndexed >= 1000 ? (s.totalMediaIndexed / 1000).toFixed(1) + 'K' : s.totalMediaIndexed;
-        document.getElementById('statStatus').textContent = s.isDownloading ? 'Downloading' : 'Idle';
+        document.getElementById('statStatus').textContent = s.isDownloading ? 'Downloading' : (s.instagramLoggedIn ? 'Ready' : 'Login Needed');
+        syncSessionState(s);
       } catch {}
+    }
+
+    async function loadSettings() {
+      try {
+        const { data } = await apiRequest('/api/settings');
+        document.getElementById('settingsDownloadPath').value = data.download_path || '';
+        document.getElementById('settingsCheckInterval').value = data.check_interval_hours ?? 24;
+        document.getElementById('settingsConcurrentProfiles').value = data.max_concurrent_profiles ?? 3;
+        document.getElementById('settingsConcurrentFiles').value = data.max_concurrent_files ?? 6;
+        document.getElementById('settingsWebPassword').value = data.web_server_password || '';
+        document.getElementById('settingsDownloadPosts').checked = !!data.download_posts;
+        document.getElementById('settingsDownloadReels').checked = !!data.download_reels;
+        document.getElementById('settingsDownloadVideos').checked = !!data.download_videos;
+        document.getElementById('settingsDownloadHighlights').checked = !!data.download_highlights;
+        document.getElementById('settingsDownloadStories').checked = !!data.download_stories;
+        document.getElementById('settingsNotificationsEnabled').checked = !!data.notifications_enabled;
+        settingsLoaded = true;
+      } catch {
+        showToast('Could not load settings', 'error');
+      }
+    }
+
+    function syncSessionState(status) {
+      const banner = document.getElementById('sessionBanner');
+      const openLoginBtn = document.getElementById('openLoginBtn');
+      const openSettingsBtn = document.getElementById('openSettingsBtn');
+      banner.style.display = status.instagramLoggedIn ? 'none' : 'flex';
+      openLoginBtn.style.display = status.canOpenLocalLogin ? 'inline-flex' : 'none';
+      openSettingsBtn.style.display = status.canOpenLocalLogin ? 'inline-flex' : 'none';
+
+      if (lastInstagramLoggedIn === true && status.instagramLoggedIn === false) {
+        showToast('Instagram login expired. Reconnect on this computer.', 'error');
+        if ('Notification' in window && Notification.permission === 'granted') {
+          new Notification('Instagram login required', {
+            body: 'InstaArchive was logged out and needs you to reconnect.'
+          });
+        }
+      }
+      lastInstagramLoggedIn = status.instagramLoggedIn;
+    }
+
+    function toggleSettings(forceOpen) {
+      const panel = document.getElementById('settingsPanel');
+      const shouldOpen = typeof forceOpen === 'boolean'
+        ? forceOpen
+        : panel.style.display !== 'block';
+      panel.style.display = shouldOpen ? 'block' : 'none';
+      if (shouldOpen) {
+        loadSettings();
+      }
+    }
+
+    async function saveSettings() {
+      const payload = {
+        download_path: document.getElementById('settingsDownloadPath').value.trim(),
+        check_interval_hours: parseInt(document.getElementById('settingsCheckInterval').value || '24', 10),
+        max_concurrent_profiles: parseInt(document.getElementById('settingsConcurrentProfiles').value || '3', 10),
+        max_concurrent_files: parseInt(document.getElementById('settingsConcurrentFiles').value || '6', 10),
+        web_server_password: document.getElementById('settingsWebPassword').value,
+        download_posts: document.getElementById('settingsDownloadPosts').checked,
+        download_reels: document.getElementById('settingsDownloadReels').checked,
+        download_videos: document.getElementById('settingsDownloadVideos').checked,
+        download_highlights: document.getElementById('settingsDownloadHighlights').checked,
+        download_stories: document.getElementById('settingsDownloadStories').checked,
+        notifications_enabled: document.getElementById('settingsNotificationsEnabled').checked
+      };
+
+      try {
+        const { data } = await apiRequest('/api/settings', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        showToast(data.message || 'Settings updated', 'success');
+        loadStatus();
+      } catch {
+        showToast('Failed to save settings', 'error');
+      }
+    }
+
+    async function requestBrowserNotifications() {
+      if (!('Notification' in window)) {
+        showToast('Browser alerts are not supported here', 'error');
+        return;
+      }
+
+      try {
+        const permission = await Notification.requestPermission();
+        if (permission === 'granted') {
+          showToast('Browser alerts enabled', 'success');
+        } else {
+          showToast('Browser alerts were not enabled', 'error');
+        }
+      } catch {
+        showToast('Could not enable browser alerts', 'error');
+      }
+    }
+
+    async function openClientLogin() {
+      try {
+        const { data } = await apiRequest('/api/client/open-login', { method: 'POST' });
+        showToast(data.message || 'Opened Instagram login', 'success');
+      } catch {
+        showToast('Could not open login on this Mac', 'error');
+      }
+    }
+
+    async function openClientSettings() {
+      try {
+        const { data } = await apiRequest('/api/client/open-settings', { method: 'POST' });
+        showToast(data.message || 'Opened settings', 'success');
+      } catch {
+        showToast('Could not open settings on this Mac', 'error');
+      }
     }
 
     function statusBadge(p) {
@@ -829,12 +1155,11 @@ class WebServer: ObservableObject {
       document.getElementById('addBtn').disabled = true;
       document.getElementById('addSyncBtn').disabled = true;
       try {
-        const res = await fetch('/api/profiles', {
+        const { data } = await apiRequest('/api/profiles', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username })
         });
-        const data = await res.json();
         if (data.error) { showToast(data.error, 'error'); }
         else {
           showToast(data.message, 'success');
@@ -853,7 +1178,7 @@ class WebServer: ObservableObject {
     async function removeProfile(username) {
       if (!confirm('Remove @' + username + '?')) return;
       try {
-        await fetch('/api/profiles/' + username, { method: 'DELETE' });
+        await apiRequest('/api/profiles/' + username, { method: 'DELETE' });
         showToast('Removed @' + username, 'success');
         loadProfiles(); loadStatus();
       } catch { showToast('Failed to remove', 'error'); }
@@ -861,8 +1186,7 @@ class WebServer: ObservableObject {
 
     async function syncProfile(username) {
       try {
-        const res = await fetch('/api/sync/' + username, { method: 'POST' });
-        const data = await res.json();
+        const { data } = await apiRequest('/api/sync/' + username, { method: 'POST' });
         showToast(data.message, 'success');
         setTimeout(loadProfiles, 1000);
       } catch { showToast('Failed to start sync', 'error'); }
@@ -871,8 +1195,7 @@ class WebServer: ObservableObject {
     async function refreshProfile(username) {
       if (!confirm('Refresh @' + username + '? This will delete and re-download posts while keeping stories, highlights, and profile photos.')) return;
       try {
-        const res = await fetch('/api/refresh/' + username, { method: 'POST' });
-        const data = await res.json();
+        const { data } = await apiRequest('/api/refresh/' + username, { method: 'POST' });
         showToast(data.message, 'success');
         setTimeout(loadProfiles, 1000);
       } catch { showToast('Failed to start refresh', 'error'); }
@@ -880,8 +1203,7 @@ class WebServer: ObservableObject {
 
     async function syncAll() {
       try {
-        const res = await fetch('/api/sync/all', { method: 'POST' });
-        const data = await res.json();
+        const { data } = await apiRequest('/api/sync/all', { method: 'POST' });
         showToast(data.message, 'success');
         setTimeout(loadProfiles, 1000);
       } catch { showToast('Failed to start sync', 'error'); }
@@ -909,8 +1231,7 @@ class WebServer: ObservableObject {
           const username = p.username || p;
           if (!username || typeof username !== 'string') continue;
           try {
-            const res = await fetch('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
-            const data = await res.json();
+            const { data } = await apiRequest('/api/profiles', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username }) });
             if (data.success) added++;
           } catch {}
         }
@@ -925,8 +1246,7 @@ class WebServer: ObservableObject {
     async function showDetail(username) {
       currentDetail = username;
       try {
-        const res = await fetch('/api/profile/' + username);
-        const d = await res.json();
+        const { data: d } = await apiRequest('/api/profile/' + username);
         if (d.error) { showToast(d.error, 'error'); return; }
 
         document.getElementById('detailAvatar').textContent = d.username[0].toUpperCase();
@@ -998,7 +1318,7 @@ class WebServer: ObservableObject {
       if (!currentDetail) return;
       if (!confirm('Remove @' + currentDetail + '?')) return;
       try {
-        await fetch('/api/profiles/' + currentDetail, { method: 'DELETE' });
+        await apiRequest('/api/profiles/' + currentDetail, { method: 'DELETE' });
         showToast('Removed @' + currentDetail, 'success');
         showList();
       } catch { showToast('Failed to remove', 'error'); }
@@ -1016,6 +1336,7 @@ class WebServer: ObservableObject {
 
     loadProfiles();
     loadStatus();
+    loadSettings();
     setInterval(() => { loadStatus(); if (!currentDetail) loadProfiles(); }, 5000);
     </script>
     </body>

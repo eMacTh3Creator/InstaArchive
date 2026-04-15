@@ -91,14 +91,70 @@ class StorageManager:
     def media_dir(self, username: str, media_type: str) -> Path:
         return self.profile_dir(username) / media_type
 
+    def preferred_extension(self, media_url: Optional[str], fallback_is_video: bool) -> str:
+        if media_url:
+            lowered = media_url.lower()
+            path = Path(media_url.split("?", 1)[0].split("#", 1)[0])
+            ext = path.suffix.lower().lstrip(".")
+            if ext in {"jpg", "jpeg", "png", "webp", "mp4", "mov", "m4v"}:
+                if ext == "jpeg":
+                    return "jpg"
+                if ext in {"mov", "m4v"}:
+                    return "mp4"
+                return ext
+            if ".mp4" in lowered or "video" in lowered:
+                return "mp4"
+            if ".webp" in lowered:
+                return "webp"
+            if ".png" in lowered:
+                return "png"
+        return "mp4" if fallback_is_video else "jpg"
+
+    def detected_extension(self, data: bytes, media_url: Optional[str], fallback_is_video: bool) -> str:
+        if len(data) >= 12 and data[4:8] == b"ftyp":
+            return "mp4"
+        if len(data) >= 3 and data[:3] == b"\xFF\xD8\xFF":
+            return "jpg"
+        if len(data) >= 8 and data[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "webp"
+        return self.preferred_extension(media_url, fallback_is_video)
+
     def save_path(self, username: str, media_type: str, instagram_id: str,
                   timestamp: datetime, is_video: bool, index: int = 0,
-                  total: int = 1) -> Path:
-        ext = "mp4" if is_video else "jpg"
+                  total: int = 1, media_url: Optional[str] = None,
+                  file_ext: Optional[str] = None) -> Path:
+        ext = (file_ext or self.preferred_extension(media_url, is_video)).lower()
         ts  = int(timestamp.timestamp())
         suffix = f"_{index + 1}" if total > 1 else ""
         filename = f"{instagram_id}_{ts}{suffix}.{ext}"
         return self.media_dir(username, media_type) / filename
+
+    def existing_save_path(self, username: str, media_type: str, instagram_id: str,
+                           timestamp: datetime, is_video: bool, index: int = 0,
+                           total: int = 1, media_url: Optional[str] = None) -> Optional[Path]:
+        preferred = self.save_path(
+            username,
+            media_type,
+            instagram_id,
+            timestamp,
+            is_video,
+            index,
+            total,
+            media_url=media_url,
+        )
+        if preferred.exists():
+            return preferred
+
+        ts = int(timestamp.timestamp())
+        suffix = f"_{index + 1}" if total > 1 else ""
+        base = f"{instagram_id}_{ts}{suffix}"
+        for ext in ("mp4", "jpg", "jpeg", "png", "webp"):
+            candidate = self.media_dir(username, media_type) / f"{base}.{ext}"
+            if candidate.exists():
+                return candidate
+        return None
 
     # ------------------------------------------------------------------
     # Directory creation

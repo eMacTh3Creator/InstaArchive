@@ -8,6 +8,7 @@ struct ContentView: View {
     @State private var selectedProfileIds: Set<UUID> = []
     @State private var showingAddProfile = false
     @State private var showingSettings = false
+    @State private var showingInstagramLogin = false
     @State private var showingDeleteConfirmation = false
     @State private var pendingDeleteIds: Set<UUID> = []
     @State private var searchText = ""
@@ -96,6 +97,9 @@ struct ContentView: View {
         .sheet(isPresented: $showingSettings) {
             SettingsView()
         }
+        .sheet(isPresented: $showingInstagramLogin) {
+            InstagramLoginView()
+        }
         .alert("Remove Profiles", isPresented: $showingDeleteConfirmation) {
             Button("Cancel", role: .cancel) {
                 pendingDeleteIds.removeAll()
@@ -117,6 +121,16 @@ struct ContentView: View {
         .focusedSceneValue(\.showingAddProfile, $showingAddProfile)
         .focusedSceneValue(\.showingSettings, $showingSettings)
         .focusedSceneValue(\.checkAllAction, checkAll)
+        .onReceive(NotificationCenter.default.publisher(for: .webServerOpenInstagramLogin)) { _ in
+            selectedProfile = nil
+            selectedProfileIds.removeAll()
+            showingInstagramLogin = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .webServerOpenSettings)) { _ in
+            selectedProfile = nil
+            selectedProfileIds.removeAll()
+            showingSettings = true
+        }
     }
 
     // MARK: - Actions

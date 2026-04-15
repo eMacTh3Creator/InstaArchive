@@ -216,6 +216,8 @@ def get_status():
         "activeProfiles":   sum(1 for p in profs if p.get("is_active", True)),
         "totalMediaIndexed": dm.total_downloaded,
         "currentActivity":  dm.current_activity,
+        "instagramLoggedIn": _settings.is_logged_in,
+        "canOpenLocalLogin": False,
     })
 
 
@@ -318,6 +320,7 @@ def get_settings():
         "download_stories":      s.download_stories,
         "max_concurrent_profiles": s.max_concurrent_profiles,
         "max_concurrent_files":  s.max_concurrent_files,
+        "notifications_enabled": bool(s.get("notifications_enabled")),
         "web_server_port":       s.web_server_port,
         "web_server_password":   s.web_server_password,
     })
@@ -332,7 +335,7 @@ def update_settings():
     allowed = {
         "download_path", "check_interval_hours", "download_posts", "download_reels",
         "download_videos", "download_highlights", "download_stories",
-        "max_concurrent_profiles", "max_concurrent_files",
+        "max_concurrent_profiles", "max_concurrent_files", "notifications_enabled",
         "web_server_port", "web_server_password",
     }
     updates = {k: v for k, v in data.items() if k in allowed}
@@ -474,13 +477,18 @@ INDEX_HTML = """<!DOCTYPE html>
 :root{--bg:#0a0a0a;--card:#161616;--border:#2a2a2a;--text:#e8e8e8;--sub:#888;--accent:#6366f1;--ah:#818cf8;--green:#22c55e;--red:#ef4444;--orange:#f59e0b}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
-.container{max-width:660px;margin:0 auto;padding:40px 20px}
+.container{max-width:640px;margin:0 auto;padding:40px 20px}
 h1{font-size:24px;font-weight:600;margin-bottom:4px}
 .subtitle{color:var(--sub);font-size:14px;margin-bottom:32px}
+.header-actions{display:flex;gap:10px;margin-bottom:18px;flex-wrap:wrap}
 .status-bar{display:flex;gap:24px;margin-bottom:28px;padding:14px 18px;background:var(--card);border:1px solid var(--border);border-radius:10px}
 .stat{display:flex;flex-direction:column}
 .stat-val{font-size:20px;font-weight:600;font-variant-numeric:tabular-nums}
 .stat-label{font-size:11px;color:var(--sub);margin-top:2px;text-transform:uppercase;letter-spacing:.5px}
+.session-banner{display:none;gap:16px;align-items:center;justify-content:space-between;margin-bottom:20px;padding:16px 18px;background:#1c1105;border:1px solid #4a2d07;border-radius:12px}
+.session-title{font-size:14px;font-weight:600;margin-bottom:3px}
+.session-copy{color:#d1b48c;font-size:12px;line-height:1.45}
+.session-actions{display:flex;gap:10px;flex-wrap:wrap}
 .add-form{display:flex;gap:10px;margin-bottom:28px}
 .add-form input{flex:1;padding:10px 14px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--text);font-size:14px;outline:none;transition:border-color .15s}
 .add-form input:focus{border-color:var(--accent)}
@@ -516,6 +524,17 @@ h1{font-size:24px;font-weight:600;margin-bottom:4px}
 .empty{text-align:center;padding:40px 20px;color:var(--sub)}
 #fileInput{display:none}
 .loading{text-align:center;padding:20px;color:var(--sub)}
+.settings-panel{display:none;margin-bottom:28px;padding:18px;background:var(--card);border:1px solid var(--border);border-radius:12px}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-top:16px}
+.field{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--sub)}
+.field-wide{grid-column:1 / -1}
+.field input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;outline:none}
+.field input:focus{border-color:var(--accent)}
+.toggle-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:10px;grid-column:1 / -1}
+.check-field{display:flex;align-items:center;gap:8px;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg);font-size:13px;color:var(--text)}
+.check-field input{accent-color:var(--accent)}
+.settings-actions{display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap}
+.settings-note{font-size:12px;color:var(--sub)}
 .detail-panel{display:none}
 .detail-panel.open{display:block}
 .back-btn{background:none;border:none;color:var(--accent);font-size:13px;cursor:pointer;padding:0;margin-bottom:20px;display:flex;align-items:center;gap:4px}
@@ -525,7 +544,7 @@ h1{font-size:24px;font-weight:600;margin-bottom:4px}
 .detail-name{font-size:20px;font-weight:600}
 .detail-sub{font-size:13px;color:var(--sub);margin-top:2px}
 .detail-bio{font-size:13px;color:var(--sub);margin-top:4px;line-height:1.4}
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:24px}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:24px}
 .stat-card{padding:14px;background:var(--card);border:1px solid var(--border);border-radius:10px}
 .stat-card .stat-val{font-size:18px}
 .stat-card .stat-label{font-size:10px}
@@ -542,16 +561,78 @@ h1{font-size:24px;font-weight:600;margin-bottom:4px}
   <div id="listView">
     <h1>InstaArchive</h1>
     <p class="subtitle">Manage your archived Instagram profiles</p>
+    <div class="header-actions">
+      <button class="btn btn-sm btn-outline" onclick="toggleSettings()">Settings</button>
+      <button class="btn btn-sm btn-outline" onclick="requestBrowserNotifications()">Enable Browser Alerts</button>
+    </div>
+
+    <div class="session-banner" id="sessionBanner">
+      <div>
+        <div class="session-title">Instagram login needed</div>
+        <div class="session-copy">The local client was logged out or the session expired. Reconnect in the desktop app to keep downloads running.</div>
+      </div>
+      <div class="session-actions">
+        <button class="btn btn-sm btn-outline" onclick="toggleSettings(true)">Review Settings</button>
+      </div>
+    </div>
+
     <div class="status-bar">
       <div class="stat"><span class="stat-val" id="statProfiles">-</span><span class="stat-label">Profiles</span></div>
       <div class="stat"><span class="stat-val" id="statActive">-</span><span class="stat-label">Active</span></div>
       <div class="stat"><span class="stat-val" id="statMedia">-</span><span class="stat-label">Media</span></div>
       <div class="stat"><span class="stat-val" id="statStatus">-</span><span class="stat-label">Status</span></div>
     </div>
-    <form class="add-form" onsubmit="addProfile(event)">
+
+    <div class="settings-panel" id="settingsPanel">
+      <div class="section-head">
+        <h2>Client Settings</h2>
+        <div class="section-actions">
+          <button class="btn btn-sm btn-outline" onclick="requestBrowserNotifications()">Enable Alerts</button>
+          <button class="btn btn-sm btn-outline" onclick="toggleSettings(false)">Close</button>
+        </div>
+      </div>
+      <div class="settings-grid">
+        <label class="field field-wide">
+          <span>Download Folder</span>
+          <input type="text" id="settingsDownloadPath" spellcheck="false" />
+        </label>
+        <label class="field">
+          <span>Check Every (hours)</span>
+          <input type="number" id="settingsCheckInterval" min="1" max="720" />
+        </label>
+        <label class="field">
+          <span>Concurrent Profiles</span>
+          <input type="number" id="settingsConcurrentProfiles" min="1" max="12" />
+        </label>
+        <label class="field">
+          <span>Concurrent Files</span>
+          <input type="number" id="settingsConcurrentFiles" min="1" max="24" />
+        </label>
+        <label class="field field-wide">
+          <span>Web Password</span>
+          <input type="password" id="settingsWebPassword" />
+        </label>
+        <div class="toggle-grid">
+          <label class="check-field"><input type="checkbox" id="settingsDownloadPosts" /> <span>Posts</span></label>
+          <label class="check-field"><input type="checkbox" id="settingsDownloadReels" /> <span>Reels</span></label>
+          <label class="check-field"><input type="checkbox" id="settingsDownloadVideos" /> <span>Videos</span></label>
+          <label class="check-field"><input type="checkbox" id="settingsDownloadHighlights" /> <span>Highlights</span></label>
+          <label class="check-field"><input type="checkbox" id="settingsDownloadStories" /> <span>Stories</span></label>
+          <label class="check-field"><input type="checkbox" id="settingsNotificationsEnabled" /> <span>Desktop Notifications</span></label>
+        </div>
+      </div>
+      <div class="settings-actions">
+        <button class="btn btn-primary" onclick="saveSettings()">Save Settings</button>
+        <span class="settings-note">Changes apply to the local client right away.</span>
+      </div>
+    </div>
+
+    <form class="add-form" onsubmit="addProfile(event, true)">
       <input type="text" id="usernameInput" placeholder="Username, @handle, or Instagram URL" autocomplete="off" spellcheck="false"/>
-      <button type="submit" class="btn btn-primary" id="addBtn">Add</button>
+      <button type="button" class="btn btn-outline" id="addBtn" onclick="addProfile(null, false)">Add</button>
+      <button type="submit" class="btn btn-primary" id="addSyncBtn">Add &amp; Sync</button>
     </form>
+
     <div class="section-head">
       <h2>Profiles</h2>
       <div class="section-actions">
@@ -561,11 +642,13 @@ h1{font-size:24px;font-weight:600;margin-bottom:4px}
         <input type="file" id="fileInput" accept=".json" onchange="importProfiles(event)"/>
       </div>
     </div>
+
     <div id="profilesList" class="profiles-list"><div class="loading">Loading...</div></div>
   </div>
 
   <div id="detailView" class="detail-panel">
-    <button class="back-btn" onclick="showList()">&#8592; Back</button>
+    <button class="back-btn" onclick="showList()">&#8592; Back to profiles</button>
+
     <div class="detail-header">
       <div class="avatar" id="detailAvatar"></div>
       <div>
@@ -574,40 +657,397 @@ h1{font-size:24px;font-weight:600;margin-bottom:4px}
         <div class="detail-bio" id="detailBio"></div>
       </div>
     </div>
+
     <div class="detail-actions">
       <button class="btn btn-sm btn-sync" onclick="syncDetail()">Sync Now</button>
       <button class="btn btn-sm btn-outline" onclick="refreshDetail()">Refresh</button>
       <button class="btn btn-sm btn-danger" onclick="removeDetail()">Remove</button>
       <a id="detailIGLink" class="btn btn-sm btn-outline" target="_blank" rel="noopener">View on Instagram</a>
     </div>
+
     <div class="stats-grid" id="detailStats"></div>
+
     <div class="media-breakdown" id="mediaBreakdown">
       <h3>Media Breakdown</h3>
       <div id="mediaRows"></div>
     </div>
   </div>
 </div>
-<div class="toast" id="toast" style="opacity:0"></div>
+
+<div class="toast toast-success" id="toast" style="opacity:0"></div>
+
 <script>
-let profiles=[];let currentDetail=null;
-async function loadProfiles(){try{const r=await fetch('/api/profiles');if(r.status===401){location.href='/login';return;}profiles=await r.json();renderProfiles();}catch{document.getElementById('profilesList').innerHTML='<div class="empty">Could not connect</div>';}}
-async function loadStatus(){try{const r=await fetch('/api/status');if(r.status===401)return;const s=await r.json();document.getElementById('statProfiles').textContent=s.totalProfiles;document.getElementById('statActive').textContent=s.activeProfiles;document.getElementById('statMedia').textContent=s.totalMediaIndexed>=1000?(s.totalMediaIndexed/1000).toFixed(1)+'K':s.totalMediaIndexed;document.getElementById('statStatus').textContent=s.isDownloading?'Downloading':'Idle';}catch{}}
-function statusBadge(p){const s=p.status||'idle';if(s.startsWith('downloading'))return`<span class="badge badge-syncing">Syncing ${s.split(':')[1]||''}%</span>`;if(s==='checking')return'<span class="badge badge-syncing">Checking</span>';return`<span class="badge ${p.isActive?'badge-active':'badge-paused'}">${p.isActive?'Active':'Paused'}</span>`;}
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
-function renderProfiles(){const el=document.getElementById('profilesList');if(!profiles.length){el.innerHTML='<div class="empty">No profiles yet.</div>';return;}el.innerHTML=profiles.map(p=>`<div class="profile-row" onclick="showDetail('${p.username}')"><div class="avatar">${p.username[0].toUpperCase()}</div><div class="profile-info"><div class="profile-name">@${p.username}</div><div class="profile-meta">${p.totalDownloaded} items${p.displayName!==p.username?' &middot; '+esc(p.displayName):''}</div></div>${statusBadge(p)}<button class="btn btn-sm btn-sync" onclick="event.stopPropagation();syncProfile('${p.username}')">Sync</button><button class="btn btn-sm btn-outline" onclick="event.stopPropagation();refreshProfile('${p.username}')">Refresh</button><button class="btn btn-sm btn-danger" onclick="event.stopPropagation();removeProfile('${p.username}')">Remove</button></div>`).join('');}
-async function addProfile(e){e.preventDefault();const inp=document.getElementById('usernameInput');const u=inp.value.trim();if(!u)return;document.getElementById('addBtn').disabled=true;try{const r=await fetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});const d=await r.json();if(d.error)showToast(d.error,'error');else{showToast(d.message,'success');inp.value='';}loadProfiles();loadStatus();}catch{showToast('Failed','error');}document.getElementById('addBtn').disabled=false;}
-async function removeProfile(u){if(!confirm('Remove @'+u+'?'))return;try{await fetch('/api/profiles/'+u,{method:'DELETE'});showToast('Removed @'+u,'success');loadProfiles();loadStatus();}catch{showToast('Failed','error');}}
-async function syncProfile(u){try{const r=await fetch('/api/sync/'+u,{method:'POST'});const d=await r.json();showToast(d.message,'success');setTimeout(loadProfiles,1000);}catch{showToast('Failed','error');}}
-async function refreshProfile(u){if(!confirm('Refresh @'+u+'? This will delete and re-download posts while keeping stories, highlights, and profile photos.'))return;try{const r=await fetch('/api/refresh/'+u,{method:'POST'});const d=await r.json();showToast(d.message,'success');setTimeout(loadProfiles,1000);}catch{showToast('Failed','error');}}
-async function syncAll(){try{const r=await fetch('/api/sync/all',{method:'POST'});const d=await r.json();showToast(d.message,'success');setTimeout(loadProfiles,1000);}catch{showToast('Failed','error');}}
-function exportProfiles(){window.location.href='/api/export';}
-async function importProfiles(e){const file=e.target.files[0];if(!file)return;try{const text=await file.text();const imported=JSON.parse(text);const list=Array.isArray(imported)?imported:(imported.profiles||[]);let added=0;for(const p of list){const u=p.username||p;if(!u||typeof u!=='string')continue;try{const r=await fetch('/api/profiles',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u})});const d=await r.json();if(d.success)added++;}catch{}}showToast('Imported '+added+' profile'+(added===1?'':'s'),'success');loadProfiles();loadStatus();}catch{showToast('Invalid file','error');}e.target.value='';}
-async function showDetail(u){currentDetail=u;try{const r=await fetch('/api/profile/'+u);const d=await r.json();if(d.error){showToast(d.error,'error');return;}document.getElementById('detailAvatar').textContent=d.username[0].toUpperCase();document.getElementById('detailName').textContent='@'+d.username;document.getElementById('detailDisplayName').textContent=d.displayName!==d.username?d.displayName:'';document.getElementById('detailBio').textContent=d.bio||'';document.getElementById('detailIGLink').href='https://www.instagram.com/'+d.username+'/';const fmtBytes=b=>{if(b>=1073741824)return(b/1073741824).toFixed(1)+' GB';if(b>=1048576)return(b/1048576).toFixed(1)+' MB';if(b>=1024)return(b/1024).toFixed(0)+' KB';return b+' B';};const fmtDate=iso=>{if(!iso)return'Never';const dt=new Date(iso);return dt.toLocaleDateString()+' '+dt.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});};document.getElementById('detailStats').innerHTML=[{v:d.totalIndexed,l:'Total Media'},{v:fmtBytes(d.totalFileSize),l:'Storage Used'},{v:fmtDate(d.lastChecked),l:'Last Checked'},{v:fmtDate(d.lastNewContent),l:'Last New Content'},{v:fmtDate(d.dateAdded),l:'Date Added'},{v:d.isActive?'Active':'Paused',l:'Status'}].map(s=>`<div class="stat-card"><div class="stat-val">${s.v}</div><div class="stat-label">${s.l}</div></div>`).join('');const types=d.mediaByType||{};const rows=Object.entries(types).sort((a,b)=>b[1]-a[1]);if(rows.length){document.getElementById('mediaBreakdown').style.display='block';document.getElementById('mediaRows').innerHTML=rows.map(([t,c])=>`<div class="media-row"><span>${t}</span><span class="media-count">${c}</span></div>`).join('');}else{document.getElementById('mediaBreakdown').style.display='none';}document.getElementById('listView').style.display='none';document.getElementById('detailView').className='detail-panel open';}catch{showToast('Failed to load','error');}}
-function showList(){currentDetail=null;document.getElementById('detailView').className='detail-panel';document.getElementById('listView').style.display='block';loadProfiles();}
-async function syncDetail(){if(!currentDetail)return;await syncProfile(currentDetail);setTimeout(()=>showDetail(currentDetail),1500);}
-async function refreshDetail(){if(!currentDetail)return;await refreshProfile(currentDetail);setTimeout(()=>showDetail(currentDetail),1500);}
-async function removeDetail(){if(!currentDetail)return;if(!confirm('Remove @'+currentDetail+'?'))return;try{await fetch('/api/profiles/'+currentDetail,{method:'DELETE'});showToast('Removed @'+currentDetail,'success');showList();}catch{showToast('Failed','error');}}
-function showToast(msg,type){const el=document.getElementById('toast');el.textContent=msg;el.className='toast toast-'+type;el.style.opacity='1';setTimeout(()=>{el.style.opacity='0';},2500);}
-loadProfiles();loadStatus();setInterval(()=>{loadStatus();if(!currentDetail)loadProfiles();},5000);
+let profiles = [];
+let currentDetail = null;
+let lastInstagramLoggedIn = null;
+let settingsLoaded = false;
+
+async function apiRequest(url, options = {}) {
+  const res = await fetch(url, options);
+  if (res.status === 401) {
+    window.location.href = '/login';
+    throw new Error('Unauthorized');
+  }
+  let data = {};
+  try { data = await res.json(); } catch {}
+  return { res, data };
+}
+
+async function loadProfiles() {
+  try {
+    const { data } = await apiRequest('/api/profiles');
+    profiles = data;
+    renderProfiles();
+  } catch {
+    document.getElementById('profilesList').innerHTML = '<div class="empty">Could not connect to InstaArchive</div>';
+  }
+}
+
+async function loadStatus() {
+  try {
+    const { data: s } = await apiRequest('/api/status');
+    document.getElementById('statProfiles').textContent = s.totalProfiles;
+    document.getElementById('statActive').textContent = s.activeProfiles;
+    document.getElementById('statMedia').textContent = s.totalMediaIndexed >= 1000 ? (s.totalMediaIndexed / 1000).toFixed(1) + 'K' : s.totalMediaIndexed;
+    document.getElementById('statStatus').textContent = s.isDownloading ? 'Downloading' : (s.instagramLoggedIn ? 'Ready' : 'Login Needed');
+    syncSessionState(s);
+  } catch {}
+}
+
+async function loadSettings() {
+  try {
+    const { data } = await apiRequest('/api/settings');
+    document.getElementById('settingsDownloadPath').value = data.download_path || '';
+    document.getElementById('settingsCheckInterval').value = data.check_interval_hours ?? 24;
+    document.getElementById('settingsConcurrentProfiles').value = data.max_concurrent_profiles ?? 3;
+    document.getElementById('settingsConcurrentFiles').value = data.max_concurrent_files ?? 6;
+    document.getElementById('settingsWebPassword').value = data.web_server_password || '';
+    document.getElementById('settingsDownloadPosts').checked = !!data.download_posts;
+    document.getElementById('settingsDownloadReels').checked = !!data.download_reels;
+    document.getElementById('settingsDownloadVideos').checked = !!data.download_videos;
+    document.getElementById('settingsDownloadHighlights').checked = !!data.download_highlights;
+    document.getElementById('settingsDownloadStories').checked = !!data.download_stories;
+    document.getElementById('settingsNotificationsEnabled').checked = !!data.notifications_enabled;
+    settingsLoaded = true;
+  } catch {
+    showToast('Could not load settings', 'error');
+  }
+}
+
+function syncSessionState(status) {
+  const banner = document.getElementById('sessionBanner');
+  banner.style.display = status.instagramLoggedIn ? 'none' : 'flex';
+
+  if (lastInstagramLoggedIn === true && status.instagramLoggedIn === false) {
+    showToast('Instagram login expired. Reconnect in the desktop app.', 'error');
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification('Instagram login required', {
+        body: 'InstaArchive was logged out and needs you to reconnect.'
+      });
+    }
+  }
+  lastInstagramLoggedIn = status.instagramLoggedIn;
+}
+
+function toggleSettings(forceOpen) {
+  const panel = document.getElementById('settingsPanel');
+  const shouldOpen = typeof forceOpen === 'boolean'
+    ? forceOpen
+    : panel.style.display !== 'block';
+  panel.style.display = shouldOpen ? 'block' : 'none';
+  if (shouldOpen) {
+    loadSettings();
+  }
+}
+
+async function saveSettings() {
+  const payload = {
+    download_path: document.getElementById('settingsDownloadPath').value.trim(),
+    check_interval_hours: parseInt(document.getElementById('settingsCheckInterval').value || '24', 10),
+    max_concurrent_profiles: parseInt(document.getElementById('settingsConcurrentProfiles').value || '3', 10),
+    max_concurrent_files: parseInt(document.getElementById('settingsConcurrentFiles').value || '6', 10),
+    web_server_password: document.getElementById('settingsWebPassword').value,
+    download_posts: document.getElementById('settingsDownloadPosts').checked,
+    download_reels: document.getElementById('settingsDownloadReels').checked,
+    download_videos: document.getElementById('settingsDownloadVideos').checked,
+    download_highlights: document.getElementById('settingsDownloadHighlights').checked,
+    download_stories: document.getElementById('settingsDownloadStories').checked,
+    notifications_enabled: document.getElementById('settingsNotificationsEnabled').checked
+  };
+
+  try {
+    const { data } = await apiRequest('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    showToast(data.message || 'Settings updated', 'success');
+    loadStatus();
+  } catch {
+    showToast('Failed to save settings', 'error');
+  }
+}
+
+async function requestBrowserNotifications() {
+  if (!('Notification' in window)) {
+    showToast('Browser alerts are not supported here', 'error');
+    return;
+  }
+
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission === 'granted') {
+      showToast('Browser alerts enabled', 'success');
+    } else {
+      showToast('Browser alerts were not enabled', 'error');
+    }
+  } catch {
+    showToast('Could not enable browser alerts', 'error');
+  }
+}
+
+function statusBadge(p) {
+  const s = p.status || 'idle';
+  if (s.startsWith('downloading')) return `<span class="badge badge-syncing">Syncing ${s.split(':')[1] || ''}%</span>`;
+  if (s === 'checking') return '<span class="badge badge-syncing">Checking</span>';
+  return `<span class="badge ${p.isActive ? 'badge-active' : 'badge-paused'}">${p.isActive ? 'Active' : 'Paused'}</span>`;
+}
+
+function renderProfiles() {
+  const el = document.getElementById('profilesList');
+  if (profiles.length === 0) {
+    el.innerHTML = '<div class="empty">No profiles yet. Add one above.</div>';
+    return;
+  }
+  el.innerHTML = profiles.map(p => `
+    <div class="profile-row" onclick="showDetail('${p.username}')">
+      <div class="avatar">${p.username[0].toUpperCase()}</div>
+      <div class="profile-info">
+        <div class="profile-name">@${p.username}</div>
+        <div class="profile-meta">${p.totalDownloaded} items${p.displayName !== p.username ? ' &middot; ' + esc(p.displayName) : ''}</div>
+      </div>
+      ${statusBadge(p)}
+      <button class="btn btn-sm btn-sync" onclick="event.stopPropagation(); syncProfile('${p.username}')">Sync</button>
+      <button class="btn btn-sm btn-outline" onclick="event.stopPropagation(); refreshProfile('${p.username}')">Refresh</button>
+      <button class="btn btn-sm btn-danger" onclick="event.stopPropagation(); removeProfile('${p.username}')">Remove</button>
+    </div>
+  `).join('');
+}
+
+function esc(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+async function addProfile(e, startSync) {
+  if (e) e.preventDefault();
+  const input = document.getElementById('usernameInput');
+  const username = input.value.trim();
+  if (!username) return;
+  document.getElementById('addBtn').disabled = true;
+  document.getElementById('addSyncBtn').disabled = true;
+  try {
+    const { data } = await apiRequest('/api/profiles', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username })
+    });
+    if (data.error) {
+      showToast(data.error, 'error');
+    } else {
+      showToast(data.message, 'success');
+      input.value = '';
+      if (startSync) {
+        await apiRequest('/api/sync/' + encodeURIComponent(username), { method: 'POST' });
+        showToast('Sync started for @' + username, 'success');
+      }
+    }
+    loadProfiles();
+    loadStatus();
+  } catch {
+    showToast('Failed to add profile', 'error');
+  }
+  document.getElementById('addBtn').disabled = false;
+  document.getElementById('addSyncBtn').disabled = false;
+}
+
+async function removeProfile(username) {
+  if (!confirm('Remove @' + username + '?')) return;
+  try {
+    await apiRequest('/api/profiles/' + username, { method: 'DELETE' });
+    showToast('Removed @' + username, 'success');
+    loadProfiles();
+    loadStatus();
+  } catch {
+    showToast('Failed to remove', 'error');
+  }
+}
+
+async function syncProfile(username) {
+  try {
+    const { data } = await apiRequest('/api/sync/' + username, { method: 'POST' });
+    showToast(data.message, 'success');
+    setTimeout(loadProfiles, 1000);
+  } catch {
+    showToast('Failed to start sync', 'error');
+  }
+}
+
+async function refreshProfile(username) {
+  if (!confirm('Refresh @' + username + '? This will delete and re-download posts while keeping stories, highlights, and profile photos.')) return;
+  try {
+    const { data } = await apiRequest('/api/refresh/' + username, { method: 'POST' });
+    showToast(data.message, 'success');
+    setTimeout(loadProfiles, 1000);
+  } catch {
+    showToast('Failed to start refresh', 'error');
+  }
+}
+
+async function syncAll() {
+  try {
+    const { data } = await apiRequest('/api/sync/all', { method: 'POST' });
+    showToast(data.message, 'success');
+    setTimeout(loadProfiles, 1000);
+  } catch {
+    showToast('Failed to start sync', 'error');
+  }
+}
+
+function exportProfiles() {
+  const data = JSON.stringify(profiles, null, 2);
+  const blob = new Blob([data], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'instaarchive-profiles.json';
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('Exported ' + profiles.length + ' profiles', 'success');
+}
+
+async function importProfiles(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  try {
+    const text = await file.text();
+    const imported = JSON.parse(text);
+    const list = Array.isArray(imported) ? imported : (imported.profiles || []);
+    let added = 0;
+    for (const p of list) {
+      const username = p.username || p;
+      if (!username || typeof username !== 'string') continue;
+      try {
+        const { data } = await apiRequest('/api/profiles', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username })
+        });
+        if (data.success) added++;
+      } catch {}
+    }
+    showToast('Imported ' + added + ' new profile' + (added === 1 ? '' : 's'), 'success');
+    loadProfiles();
+    loadStatus();
+  } catch {
+    showToast('Invalid JSON file', 'error');
+  }
+  e.target.value = '';
+}
+
+async function showDetail(username) {
+  currentDetail = username;
+  try {
+    const { data: d } = await apiRequest('/api/profile/' + username);
+    if (d.error) {
+      showToast(d.error, 'error');
+      return;
+    }
+
+    document.getElementById('detailAvatar').textContent = d.username[0].toUpperCase();
+    document.getElementById('detailName').textContent = '@' + d.username;
+    document.getElementById('detailDisplayName').textContent = d.displayName !== d.username ? d.displayName : '';
+    document.getElementById('detailBio').textContent = d.bio || '';
+    document.getElementById('detailIGLink').href = 'https://www.instagram.com/' + d.username + '/';
+
+    const fmtBytes = (b) => {
+      if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
+      if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+      if (b >= 1024) return (b / 1024).toFixed(0) + ' KB';
+      return b + ' B';
+    };
+    const fmtDate = (iso) => {
+      if (!iso) return 'Never';
+      const d = new Date(iso);
+      return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+    };
+
+    document.getElementById('detailStats').innerHTML = [
+      { v: d.totalIndexed, l: 'Total Media' },
+      { v: fmtBytes(d.totalFileSize), l: 'Storage Used' },
+      { v: fmtDate(d.lastChecked), l: 'Last Checked' },
+      { v: fmtDate(d.lastNewContent), l: 'Last New Content' },
+      { v: fmtDate(d.dateAdded), l: 'Date Added' },
+      { v: d.isActive ? 'Active' : 'Paused', l: 'Status' },
+    ].map(s => `<div class="stat-card"><div class="stat-val">${s.v}</div><div class="stat-label">${s.l}</div></div>`).join('');
+
+    const types = d.mediaByType || {};
+    const rows = Object.entries(types).sort((a,b) => b[1] - a[1]);
+    if (rows.length > 0) {
+      document.getElementById('mediaBreakdown').style.display = 'block';
+      document.getElementById('mediaRows').innerHTML = rows.map(([type, count]) =>
+        `<div class="media-row"><span>${type}</span><span class="media-count">${count}</span></div>`
+      ).join('');
+    } else {
+      document.getElementById('mediaBreakdown').style.display = 'none';
+    }
+
+    document.getElementById('listView').style.display = 'none';
+    document.getElementById('detailView').className = 'detail-panel open';
+  } catch {
+    showToast('Failed to load profile', 'error');
+  }
+}
+
+function showList() {
+  currentDetail = null;
+  document.getElementById('detailView').className = 'detail-panel';
+  document.getElementById('listView').style.display = 'block';
+  loadProfiles();
+}
+
+async function syncDetail() {
+  if (!currentDetail) return;
+  await syncProfile(currentDetail);
+  setTimeout(() => showDetail(currentDetail), 1500);
+}
+
+async function refreshDetail() {
+  if (!currentDetail) return;
+  await refreshProfile(currentDetail);
+  setTimeout(() => showDetail(currentDetail), 1500);
+}
+
+async function removeDetail() {
+  if (!currentDetail) return;
+  if (!confirm('Remove @' + currentDetail + '?')) return;
+  try {
+    await apiRequest('/api/profiles/' + currentDetail, { method: 'DELETE' });
+    showToast('Removed @' + currentDetail, 'success');
+    showList();
+  } catch {
+    showToast('Failed to remove', 'error');
+  }
+}
+
+function showToast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast toast-' + type;
+  el.style.opacity = '1';
+  setTimeout(() => { el.style.opacity = '0'; }, 2500);
+}
+
+loadProfiles();
+loadStatus();
+loadSettings();
+setInterval(() => { loadStatus(); if (!currentDetail) loadProfiles(); }, 5000);
 </script>
 </body></html>"""

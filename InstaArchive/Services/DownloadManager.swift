@@ -474,7 +474,7 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 let index: Int
                 let url: String
                 let itemId: String
-                let savePath: URL
+                let preferredSavePath: URL
             }
 
             var jobs: [DownloadJob] = []
@@ -488,16 +488,19 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
 
                     if isDownloaded(itemId) { continue }
 
-                    let savePath = storage.savePath(for: media, username: username, index: index)
-
-                    if FileManager.default.fileExists(atPath: savePath.path) {
-                        let fileSize = (try? FileManager.default.attributesOfItem(atPath: savePath.path)[.size] as? Int64) ?? 0
+                    if let existingPath = storage.existingSavePath(
+                        for: media,
+                        username: username,
+                        index: index,
+                        mediaURL: url
+                    ) {
+                        let fileSize = (try? FileManager.default.attributesOfItem(atPath: existingPath.path)[.size] as? Int64) ?? 0
                         let mediaItem = MediaItem(
                             profileUsername: username,
                             mediaType: media.mediaType,
                             instagramId: itemId,
                             mediaURL: url,
-                            localPath: savePath.path,
+                            localPath: existingPath.path,
                             caption: media.caption,
                             timestamp: media.timestamp,
                             fileSize: fileSize,
@@ -507,7 +510,20 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                         continue
                     }
 
-                    jobs.append(DownloadJob(media: media, index: index, url: url, itemId: itemId, savePath: savePath))
+                    let preferredSavePath = storage.savePath(
+                        for: media,
+                        username: username,
+                        index: index,
+                        mediaURL: url
+                    )
+
+                    jobs.append(DownloadJob(
+                        media: media,
+                        index: index,
+                        url: url,
+                        itemId: itemId,
+                        preferredSavePath: preferredSavePath
+                    ))
                 }
             }
 
@@ -536,10 +552,28 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
 
                         do {
                             let data = try await self.instagram.downloadMediaData(from: job.url)
-                            try self.storage.saveFile(data: data, to: job.savePath)
+                            let finalExtension = self.storage.detectedFileExtension(
+                                for: data,
+                                mediaURL: job.url,
+                                fallbackIsVideo: job.media.isVideo
+                            )
+                            let finalSavePath = self.storage.savePath(
+                                for: job.media,
+                                username: username,
+                                index: job.index,
+                                fileExtension: finalExtension
+                            )
+                            try self.storage.saveFile(data: data, to: finalSavePath)
 
                             if data.count < 102400 {
                                 self.log.warn("Small file: \(job.itemId) = \(data.count) bytes, URL: \(String(job.url.prefix(100)))", context: "download")
+                            }
+
+                            if finalSavePath.pathExtension.lowercased() != job.preferredSavePath.pathExtension.lowercased() {
+                                self.log.info(
+                                    "Adjusted extension for \(job.itemId) to .\(finalSavePath.pathExtension.lowercased())",
+                                    context: "download"
+                                )
                             }
 
                             let mediaItem = MediaItem(
@@ -547,7 +581,7 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                                 mediaType: job.media.mediaType,
                                 instagramId: job.itemId,
                                 mediaURL: job.url,
-                                localPath: job.savePath.path,
+                                localPath: finalSavePath.path,
                                 caption: job.media.caption,
                                 timestamp: job.media.timestamp,
                                 fileSize: Int64(data.count),

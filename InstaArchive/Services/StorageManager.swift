@@ -8,6 +8,7 @@ class StorageManager {
     private let settings = AppSettings.shared
     private let profilesFileName = "profiles.json"
     private let mediaIndexFileName = "media_index.json"
+    private let knownMediaExtensions = ["mp4", "jpg", "jpeg", "png", "webp"]
 
     private var appSupportDirectory: URL {
         let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -47,13 +48,104 @@ class StorageManager {
     }
 
     /// Get the save path for a media item
-    func savePath(for media: DiscoveredMedia, username: String, index: Int = 0) -> URL {
+    func savePath(
+        for media: DiscoveredMedia,
+        username: String,
+        index: Int = 0,
+        mediaURL: String? = nil,
+        fileExtension: String? = nil
+    ) -> URL {
         let dir = settings.mediaDirectory(for: username, type: media.mediaType)
+        let filename = baseFileName(for: media, index: index)
+        let ext = (fileExtension ?? preferredFileExtension(for: mediaURL, fallbackIsVideo: media.isVideo))
+            .lowercased()
+        return dir.appendingPathComponent("\(filename).\(ext)")
+    }
+
+    /// Find an already-downloaded path for a media item regardless of extension.
+    func existingSavePath(for media: DiscoveredMedia, username: String, index: Int = 0, mediaURL: String? = nil) -> URL? {
+        let preferred = savePath(for: media, username: username, index: index, mediaURL: mediaURL)
+        if fileManager.fileExists(atPath: preferred.path) {
+            return preferred
+        }
+
+        let dir = settings.mediaDirectory(for: username, type: media.mediaType)
+        let baseName = baseFileName(for: media, index: index)
+        for ext in knownMediaExtensions {
+            let candidate = dir.appendingPathComponent("\(baseName).\(ext)")
+            if fileManager.fileExists(atPath: candidate.path) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    /// Infer the expected file extension from the media URL before download.
+    func preferredFileExtension(for mediaURL: String?, fallbackIsVideo: Bool) -> String {
+        if let ext = fileExtensionFromURL(mediaURL) {
+            return ext
+        }
+        return fallbackIsVideo ? "mp4" : "jpg"
+    }
+
+    /// Infer the final file extension from the downloaded bytes, then fall back to URL hints.
+    func detectedFileExtension(for data: Data, mediaURL: String?, fallbackIsVideo: Bool) -> String {
+        if isMP4(data) { return "mp4" }
+        if isJPEG(data) { return "jpg" }
+        if isPNG(data) { return "png" }
+        if isWEBP(data) { return "webp" }
+        return preferredFileExtension(for: mediaURL, fallbackIsVideo: fallbackIsVideo)
+    }
+
+    private func baseFileName(for media: DiscoveredMedia, index: Int) -> String {
         let timestamp = Int(media.timestamp.timeIntervalSince1970)
-        let ext = media.isVideo ? "mp4" : "jpg"
         let suffix = media.mediaURLs.count > 1 ? "_\(index + 1)" : ""
-        let filename = "\(media.instagramId)_\(timestamp)\(suffix).\(ext)"
-        return dir.appendingPathComponent(filename)
+        return "\(media.instagramId)_\(timestamp)\(suffix)"
+    }
+
+    private func fileExtensionFromURL(_ mediaURL: String?) -> String? {
+        guard let mediaURL, let url = URL(string: mediaURL) else { return nil }
+        let pathExt = url.pathExtension.lowercased()
+        if !pathExt.isEmpty {
+            switch pathExt {
+            case "jpeg": return "jpg"
+            case "jpg", "png", "webp", "mp4", "mov", "m4v":
+                return pathExt == "mov" || pathExt == "m4v" ? "mp4" : pathExt
+            default:
+                break
+            }
+        }
+
+        let lowered = mediaURL.lowercased()
+        if lowered.contains(".mp4") || lowered.contains("video") {
+            return "mp4"
+        }
+        if lowered.contains(".webp") {
+            return "webp"
+        }
+        if lowered.contains(".png") {
+            return "png"
+        }
+        return nil
+    }
+
+    private func isJPEG(_ data: Data) -> Bool {
+        data.count >= 3 && data.prefix(3) == Data([0xFF, 0xD8, 0xFF])
+    }
+
+    private func isPNG(_ data: Data) -> Bool {
+        data.count >= 8 && data.prefix(8) == Data([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
+    }
+
+    private func isWEBP(_ data: Data) -> Bool {
+        guard data.count >= 12 else { return false }
+        return String(data: data.prefix(4), encoding: .ascii) == "RIFF"
+            && String(data: data.subdata(in: 8..<12), encoding: .ascii) == "WEBP"
+    }
+
+    private func isMP4(_ data: Data) -> Bool {
+        guard data.count >= 12 else { return false }
+        return String(data: data.subdata(in: 4..<8), encoding: .ascii) == "ftyp"
     }
 
     // MARK: - Profile Persistence
