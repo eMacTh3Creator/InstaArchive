@@ -833,7 +833,10 @@ class InstagramService {
 
     /// Fetch ALL posts from a public profile, paginating until complete.
     /// Pass `knownIds` to stop early when we reach already-downloaded content.
-    func fetchAllMedia(username: String, knownIds: Set<String> = []) async throws -> [DiscoveredMedia] {
+    /// Pass `since` to stop paginating once all items on a page are older than
+    /// the cutoff — used for selective initial sync so users don't download
+    /// years of history they don't need.
+    func fetchAllMedia(username: String, knownIds: Set<String> = [], since: Date? = nil) async throws -> [DiscoveredMedia] {
         try await ensureSession()
 
         workingStrategy = nil
@@ -860,15 +863,31 @@ class InstagramService {
 
             var newOnThisPage = 0
             var knownOnThisPage = 0
+            var tooOldOnThisPage = 0
             for media in result.media {
                 guard !seenIds.contains(media.instagramId) else { continue }
                 seenIds.insert(media.instagramId)
+
+                // Skip items older than the sync cutoff date
+                if let since = since, media.timestamp < since {
+                    tooOldOnThisPage += 1
+                    continue
+                }
+
                 allMedia.append(media)
                 newOnThisPage += 1
 
                 if knownIds.contains(media.instagramId) {
                     knownOnThisPage += 1
                 }
+            }
+
+            // If all unique items on this page are older than the sync cutoff,
+            // stop paginating — Instagram serves in reverse chronological order
+            // so everything beyond this point is even older.
+            if tooOldOnThisPage > 0 && newOnThisPage == 0 {
+                log.info("All items on page older than sync cutoff, stopping pagination (\(allMedia.count) items collected)", context: "media")
+                break
             }
 
             // Only stop early if an ENTIRE page is all already-known AND we have knownIds

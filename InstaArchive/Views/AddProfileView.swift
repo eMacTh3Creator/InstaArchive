@@ -7,6 +7,7 @@ struct AddProfileView: View {
     @State private var isLoading = false
     @State private var errorMessage: String?
     @State private var profileInfo: InstagramProfileInfo?
+    @State private var syncPeriod: Int = 0  // 0 = all time
 
     let onAdd: (Profile, Bool) -> Void  // (profile, startSync)
 
@@ -78,6 +79,26 @@ struct AddProfileView: View {
                 // Preview card
                 if let info = profileInfo {
                     profilePreview(info)
+
+                    // Sync period picker
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack {
+                            Text("Sync posts from")
+                                .font(.system(size: 13))
+                            Picker("", selection: $syncPeriod) {
+                                Text("All time").tag(0)
+                                Text("Last 1 month").tag(1)
+                                Text("Last 3 months").tag(3)
+                                Text("Last 6 months").tag(6)
+                                Text("Last 1 year").tag(12)
+                                Text("Last 2 years").tag(24)
+                            }
+                            .frame(width: 150)
+                        }
+                        Text("Limits the initial download to recent posts. Stories and highlights are always synced.")
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                    }
                 }
             }
             .padding(20)
@@ -108,7 +129,7 @@ struct AddProfileView: View {
             }
             .padding(20)
         }
-        .frame(width: 420, height: 400)
+        .frame(width: 420, height: 460)
     }
 
     private func profilePreview(_ info: InstagramProfileInfo) -> some View {
@@ -201,7 +222,8 @@ struct AddProfileView: View {
             username: info.username,
             displayName: info.fullName,
             profilePicURL: info.profilePicURL,
-            bio: info.biography
+            bio: info.biography,
+            syncSinceMonths: syncPeriod > 0 ? syncPeriod : nil
         )
         onAdd(profile, startSync)
         dismiss()

@@ -405,7 +405,8 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
             do {
                 let posts = try await instagram.fetchAllMedia(
                     username: username,
-                    knownIds: currentKnownIds()
+                    knownIds: currentKnownIds(),
+                    since: profile.syncSinceDate
                 )
                 allMedia.append(contentsOf: posts)
                 log.info("Found \(posts.count) posts for @\(username)", context: "check")

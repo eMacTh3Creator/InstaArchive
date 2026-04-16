@@ -14,6 +14,10 @@ struct Profile: Identifiable, Codable, Hashable {
     var dateAdded: Date
     /// Per-profile check interval in hours. nil = follow global setting.
     var customCheckIntervalHours: Int?
+    /// How far back to sync posts, in months. nil = sync all history.
+    /// Set once when the profile is added. Applies to posts/reels/videos only
+    /// (stories and highlights are inherently recent).
+    var syncSinceMonths: Int?
 
     init(
         id: UUID = UUID(),
@@ -26,7 +30,8 @@ struct Profile: Identifiable, Codable, Hashable {
         lastNewContent: Date? = nil,
         totalDownloaded: Int = 0,
         dateAdded: Date = Date(),
-        customCheckIntervalHours: Int? = nil
+        customCheckIntervalHours: Int? = nil,
+        syncSinceMonths: Int? = nil
     ) {
         self.id = id
         self.username = username.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
@@ -39,6 +44,13 @@ struct Profile: Identifiable, Codable, Hashable {
         self.totalDownloaded = totalDownloaded
         self.dateAdded = dateAdded
         self.customCheckIntervalHours = customCheckIntervalHours
+        self.syncSinceMonths = syncSinceMonths
+    }
+
+    /// Computed cutoff date from `syncSinceMonths`. nil = no cutoff (sync all).
+    var syncSinceDate: Date? {
+        guard let months = syncSinceMonths, months > 0 else { return nil }
+        return Calendar.current.date(byAdding: .month, value: -months, to: Date())
     }
 
     /// Effective check interval for this profile (uses global if no custom override)
