@@ -24,6 +24,7 @@ class AppSettings: ObservableObject {
         static let isLoggedIn = "isLoggedIn"
         static let webServerEnabled = "webServerEnabled"
         static let webServerPassword = "webServerPassword"
+        static let ignoreSystemProxyForInstagram = "ignoreSystemProxyForInstagram"
     }
 
     @Published var downloadPath: String {
@@ -94,6 +95,10 @@ class AppSettings: ObservableObject {
         didSet { defaults.set(webServerPassword, forKey: Keys.webServerPassword) }
     }
 
+    @Published var ignoreSystemProxyForInstagram: Bool {
+        didSet { defaults.set(ignoreSystemProxyForInstagram, forKey: Keys.ignoreSystemProxyForInstagram) }
+    }
+
     private init() {
         let defaultDownloadPath = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("InstaArchive").path ?? "~/Pictures/InstaArchive"
@@ -114,6 +119,7 @@ class AppSettings: ObservableObject {
         self.isLoggedIn = defaults.bool(forKey: Keys.isLoggedIn)
         self.webServerEnabled = defaults.object(forKey: Keys.webServerEnabled) as? Bool ?? true
         self.webServerPassword = defaults.string(forKey: Keys.webServerPassword) ?? ""
+        self.ignoreSystemProxyForInstagram = defaults.object(forKey: Keys.ignoreSystemProxyForInstagram) as? Bool ?? false
     }
 
     /// Returns the full path for a given profile's download directory

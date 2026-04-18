@@ -1,4 +1,5 @@
 import Foundation
+import CFNetwork
 
 /// Errors that can occur during Instagram operations
 enum InstagramError: LocalizedError {
@@ -58,9 +59,18 @@ class InstagramService {
     static let shared = InstagramService()
     private let log = Logger.shared
 
-    private let session: URLSession
+    private var session: URLSession
     private let baseURL = "https://www.instagram.com"
     private let igAppId = "936619743392459"
+
+    private static let sessionHeaders: [String: String] = [
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+        "sec-ch-ua": "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not-A.Brand\";v=\"99\"",
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": "\"macOS\""
+    ]
 
     /// Pick the highest-resolution image candidate from image_versions2.candidates.
     /// Instagram returns candidates in arbitrary order — sorting by width descending
@@ -181,23 +191,195 @@ class InstagramService {
     private let cdnUpgradeFailureThreshold = 3
 
     private init() {
-        let config = URLSessionConfiguration.default
+        self.session = URLSession(
+            configuration: Self.makeSessionConfiguration(
+                ignoreSystemProxies: AppSettings.shared.ignoreSystemProxyForInstagram
+            )
+        )
+    }
+
+    private static func makeSessionConfiguration(ignoreSystemProxies: Bool, ephemeral: Bool = false) -> URLSessionConfiguration {
+        let config = ephemeral ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
         config.httpCookieAcceptPolicy = .always
         config.httpCookieStorage = HTTPCookieStorage.shared
         config.httpShouldSetCookies = true
         // NOTE: Do NOT set Accept-Encoding here. URLSession handles gzip/deflate
         // decompression automatically, but ONLY if you don't override Accept-Encoding.
         // Setting it manually causes URLSession to return raw compressed bytes.
-        config.httpAdditionalHeaders = [
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_0_0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Connection": "keep-alive",
-            "sec-ch-ua": "\"Chromium\";v=\"136\", \"Google Chrome\";v=\"136\", \"Not-A.Brand\";v=\"99\"",
-            "sec-ch-ua-mobile": "?0",
-            "sec-ch-ua-platform": "\"macOS\""
-        ]
+        config.httpAdditionalHeaders = sessionHeaders
         config.timeoutIntervalForRequest = 30
-        self.session = URLSession(configuration: config)
+        if ignoreSystemProxies {
+            config.connectionProxyDictionary = [
+                kCFNetworkProxiesHTTPEnable as String: 0,
+                kCFNetworkProxiesHTTPSEnable as String: 0,
+                kCFNetworkProxiesSOCKSEnable as String: 0
+            ]
+        }
+        return config
+    }
+
+    func refreshNetworkConfiguration() {
+        let ignoreSystemProxies = AppSettings.shared.ignoreSystemProxyForInstagram
+        let oldSession = session
+        session = URLSession(configuration: Self.makeSessionConfiguration(ignoreSystemProxies: ignoreSystemProxies))
+        oldSession.invalidateAndCancel()
+        resetSession()
+        log.info("Updated Instagram networking mode (ignoreSystemProxies=\(ignoreSystemProxies ? "yes" : "no"))", context: "network")
+    }
+
+    private func probeConnectivity(ignoreSystemProxies: Bool) async -> NetworkProbeResult {
+        guard let url = URL(string: baseURL + "/robots.txt") else {
+            return NetworkProbeResult(
+                modeLabel: ignoreSystemProxies ? "Ignore System Proxies" : "Use System Networking",
+                ignoreSystemProxies: ignoreSystemProxies,
+                success: false,
+                statusCode: nil,
+                detail: "Could not build Instagram probe URL",
+                durationMilliseconds: 0
+            )
+        }
+
+        let probeSession = URLSession(
+            configuration: Self.makeSessionConfiguration(ignoreSystemProxies: ignoreSystemProxies, ephemeral: true)
+        )
+        var request = URLRequest(url: url)
+        request.setValue("text/plain,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+
+        let startedAt = Date()
+        do {
+            let (_, response) = try await probeSession.data(for: request)
+            probeSession.finishTasksAndInvalidate()
+
+            let duration = Int(Date().timeIntervalSince(startedAt) * 1000)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                return NetworkProbeResult(
+                    modeLabel: ignoreSystemProxies ? "Ignore System Proxies" : "Use System Networking",
+                    ignoreSystemProxies: ignoreSystemProxies,
+                    success: false,
+                    statusCode: nil,
+                    detail: "Received a non-HTTP response after \(duration) ms",
+                    durationMilliseconds: duration
+                )
+            }
+
+            let isSuccess = (200..<400).contains(httpResponse.statusCode)
+            return NetworkProbeResult(
+                modeLabel: ignoreSystemProxies ? "Ignore System Proxies" : "Use System Networking",
+                ignoreSystemProxies: ignoreSystemProxies,
+                success: isSuccess,
+                statusCode: httpResponse.statusCode,
+                detail: "HTTP \(httpResponse.statusCode) after \(duration) ms",
+                durationMilliseconds: duration
+            )
+        } catch {
+            probeSession.invalidateAndCancel()
+            let duration = Int(Date().timeIntervalSince(startedAt) * 1000)
+            return NetworkProbeResult(
+                modeLabel: ignoreSystemProxies ? "Ignore System Proxies" : "Use System Networking",
+                ignoreSystemProxies: ignoreSystemProxies,
+                success: false,
+                statusCode: nil,
+                detail: "\(error.localizedDescription) after \(duration) ms",
+                durationMilliseconds: duration
+            )
+        }
+    }
+
+    private func currentProxySummary() -> (summary: String, keys: [String]) {
+        guard let proxySettings = CFNetworkCopySystemProxySettings()?.takeRetainedValue() as? [String: Any] else {
+            return ("macOS did not report any proxy settings to InstaArchive.", [])
+        }
+
+        var activeKeys: [String] = []
+        let checks: [(String, String)] = [
+            (kCFNetworkProxiesHTTPEnable as String, "HTTP"),
+            (kCFNetworkProxiesHTTPSEnable as String, "HTTPS"),
+            (kCFNetworkProxiesSOCKSEnable as String, "SOCKS"),
+            (kCFNetworkProxiesProxyAutoConfigEnable as String, "Auto Config"),
+            (kCFNetworkProxiesProxyAutoDiscoveryEnable as String, "Auto Discovery")
+        ]
+
+        for (key, label) in checks {
+            if let value = proxySettings[key] as? NSNumber, value.intValue != 0 {
+                activeKeys.append(label)
+            }
+        }
+
+        if activeKeys.isEmpty {
+            return ("No system proxy settings are currently active for InstaArchive.", [])
+        }
+
+        let joined = activeKeys.joined(separator: ", ")
+        return ("macOS currently reports active proxy settings for: \(joined).", activeKeys)
+    }
+
+    func runConnectivityDiagnostics() async -> NetworkDiagnosticsSnapshot {
+        let currentModeIgnoresSystemProxies = AppSettings.shared.ignoreSystemProxyForInstagram
+        let currentProbe = await probeConnectivity(ignoreSystemProxies: currentModeIgnoresSystemProxies)
+        let alternateProbe = await probeConnectivity(ignoreSystemProxies: !currentModeIgnoresSystemProxies)
+        let proxySummary = currentProxySummary()
+
+        let snapshot: NetworkDiagnosticsSnapshot
+        if currentProbe.success {
+            snapshot = NetworkDiagnosticsSnapshot(
+                level: .ok,
+                title: "Instagram Reachable",
+                summary: "The current InstaArchive network mode can reach Instagram successfully.",
+                recommendation: nil,
+                checkedAt: Date(),
+                proxySummary: proxySummary.summary,
+                proxyKeys: proxySummary.keys,
+                currentProbe: currentProbe,
+                alternateProbe: alternateProbe,
+                suggestedIgnoreSystemProxies: nil
+            )
+        } else if alternateProbe.success {
+            let shouldIgnoreSystemProxies = !currentModeIgnoresSystemProxies
+            let summary: String
+            let recommendation: String
+            if shouldIgnoreSystemProxies {
+                summary = "Instagram became reachable only when InstaArchive ignored system proxies."
+                recommendation = "Turn on “Ignore system proxies for Instagram” if PIA bypass is not being honored on this Mac."
+            } else {
+                summary = "Instagram became reachable only when InstaArchive used the normal macOS network path."
+                recommendation = "Turn off “Ignore system proxies for Instagram” so InstaArchive follows the same routing as the rest of macOS."
+            }
+
+            snapshot = NetworkDiagnosticsSnapshot(
+                level: .warning,
+                title: "Proxy Mode Mismatch",
+                summary: summary,
+                recommendation: recommendation,
+                checkedAt: Date(),
+                proxySummary: proxySummary.summary,
+                proxyKeys: proxySummary.keys,
+                currentProbe: currentProbe,
+                alternateProbe: alternateProbe,
+                suggestedIgnoreSystemProxies: shouldIgnoreSystemProxies
+            )
+        } else {
+            snapshot = NetworkDiagnosticsSnapshot(
+                level: .error,
+                title: "Instagram Unreachable",
+                summary: "Instagram was unreachable in both network modes. This points more toward VPN routing, split tunneling, DNS, or a temporary Instagram block than a proxy-only problem.",
+                recommendation: "Leave this toggle at the mode that normally works best for you, then check PIA split tunneling, DNS, or try again with the VPN disconnected.",
+                checkedAt: Date(),
+                proxySummary: proxySummary.summary,
+                proxyKeys: proxySummary.keys,
+                currentProbe: currentProbe,
+                alternateProbe: alternateProbe,
+                suggestedIgnoreSystemProxies: nil
+            )
+        }
+
+        if snapshot.shouldWarnUser {
+            log.warn("\(snapshot.title): \(snapshot.summary)", context: "network")
+        } else {
+            log.info("Network diagnostics passed: \(snapshot.summary)", context: "network")
+        }
+
+        return snapshot
     }
 
     // MARK: - Session Management

@@ -256,6 +256,7 @@ struct HomeView: View {
     @EnvironmentObject var profileStore: ProfileStore
     @EnvironmentObject var webServer: WebServer
     @ObservedObject private var settings = AppSettings.shared
+    @ObservedObject private var diagnostics = NetworkDiagnosticsService.shared
     @State private var showingLogin = false
     @State private var totalStorage: Int64 = 0
     @State private var totalMedia: Int = 0
@@ -304,6 +305,32 @@ struct HomeView: View {
                 }
                 .padding(16)
                 .background(Color.orange.opacity(0.06))
+                .cornerRadius(10)
+            }
+
+            if diagnostics.snapshot.shouldWarnUser {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        Image(systemName: diagnostics.snapshot.level == .error ? "wifi.exclamationmark" : "network.badge.shield.half.filled")
+                            .foregroundColor(diagnostics.snapshot.level == .error ? .red : .orange)
+                        Text(diagnostics.snapshot.title)
+                            .font(.system(size: 13, weight: .semibold))
+                    }
+
+                    Text(diagnostics.snapshot.summary)
+                        .font(.system(size: 12))
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    if let recommendation = diagnostics.snapshot.recommendation {
+                        Text(recommendation)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: 520, alignment: .leading)
+                .background((diagnostics.snapshot.level == .error ? Color.red : Color.orange).opacity(0.08))
                 .cornerRadius(10)
             }
 
@@ -372,6 +399,7 @@ struct HomeView: View {
         .onAppear {
             calculateStorage()
             totalMedia = DownloadManager.shared.totalDownloaded
+            diagnostics.refreshIfStale()
         }
         .sheet(isPresented: $showingLogin) {
             InstagramLoginView()

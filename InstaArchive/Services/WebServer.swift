@@ -249,6 +249,8 @@ class WebServer: ObservableObject {
             handleGetSettings(connection: connection)
         case ("POST", "/api/settings"):
             handleUpdateSettings(body: body, connection: connection)
+        case ("POST", "/api/network/diagnostics"):
+            handleRunNetworkDiagnostics(connection: connection)
         case ("POST", "/api/client/open-login"):
             handleOpenClientLogin(connection: connection)
         case ("POST", "/api/client/open-settings"):
@@ -466,6 +468,7 @@ class WebServer: ObservableObject {
     private func handleGetStatus(connection: NWConnection) {
         let dm = DownloadManager.shared
         let profiles = self.profileStore?.profiles ?? []
+        let diagnostics = NetworkDiagnosticsService.shared.snapshot
 
         let json: [String: Any] = [
             "isDownloading": dm.isRunning,
@@ -474,7 +477,8 @@ class WebServer: ObservableObject {
             "totalMediaIndexed": dm.totalDownloaded,
             "currentActivity": dm.currentActivity,
             "instagramLoggedIn": AppSettings.shared.isLoggedIn,
-            "canOpenLocalLogin": true
+            "canOpenLocalLogin": true,
+            "networkDiagnostics": diagnostics.webPayload
         ]
         self.sendJSON(connection: connection, json: json)
     }
@@ -492,7 +496,8 @@ class WebServer: ObservableObject {
             "max_concurrent_profiles": settings.maxConcurrentDownloads,
             "max_concurrent_files": settings.maxConcurrentFileDownloads,
             "notifications_enabled": settings.notificationsEnabled,
-            "web_server_password": settings.webServerPassword
+            "web_server_password": settings.webServerPassword,
+            "ignore_system_proxy_for_instagram": settings.ignoreSystemProxyForInstagram
         ]
         sendJSON(connection: connection, json: json)
     }
@@ -508,6 +513,7 @@ class WebServer: ObservableObject {
 
         let applyUpdates = {
             let settings = AppSettings.shared
+            let previousIgnoreSystemProxy = settings.ignoreSystemProxyForInstagram
 
             if let downloadPath = json["download_path"] as? String {
                 let cleaned = downloadPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -547,6 +553,14 @@ class WebServer: ObservableObject {
             if let password = json["web_server_password"] as? String {
                 settings.webServerPassword = password
             }
+            if let enabled = json["ignore_system_proxy_for_instagram"] as? Bool {
+                settings.ignoreSystemProxyForInstagram = enabled
+            }
+
+            if settings.ignoreSystemProxyForInstagram != previousIgnoreSystemProxy {
+                InstagramService.shared.refreshNetworkConfiguration()
+                NetworkDiagnosticsService.shared.refresh()
+            }
         }
 
         if Thread.isMainThread {
@@ -556,6 +570,16 @@ class WebServer: ObservableObject {
         }
 
         sendJSON(connection: connection, json: ["success": true, "message": "Settings updated"])
+    }
+
+    private func handleRunNetworkDiagnostics(connection: NWConnection) {
+        let diagnostics = NetworkDiagnosticsService.shared
+        diagnostics.refresh()
+        sendJSON(connection: connection, json: [
+            "success": true,
+            "message": "Network diagnostics started",
+            "networkDiagnostics": diagnostics.snapshot.webPayload
+        ])
     }
 
     private func handleOpenClientLogin(connection: NWConnection) {
@@ -814,6 +838,15 @@ class WebServer: ObservableObject {
       .check-field input { accent-color: var(--accent); }
       .settings-actions { display: flex; gap: 10px; align-items: center; margin-top: 16px; flex-wrap: wrap; }
       .settings-note { font-size: 12px; color: var(--sub); }
+      .diag-card { grid-column: 1 / -1; padding: 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); }
+      .diag-card[data-level="ok"] { background: #052e16; border-color: #14532d; }
+      .diag-card[data-level="warning"] { background: #1c1105; border-color: #4a2d07; }
+      .diag-card[data-level="error"] { background: #1a0808; border-color: #7f1d1d; }
+      .diag-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+      .diag-title { font-size: 13px; font-weight: 600; }
+      .diag-copy { font-size: 12px; line-height: 1.45; }
+      .diag-sub { margin-top: 6px; color: var(--sub); }
+      .diag-reco { margin-top: 6px; color: var(--accent-hover); font-weight: 500; }
 
       /* Profile detail panel */
       .detail-panel { display: none; }
@@ -903,6 +936,18 @@ class WebServer: ObservableObject {
               <label class="check-field"><input type="checkbox" id="settingsDownloadHighlights" /> <span>Highlights</span></label>
               <label class="check-field"><input type="checkbox" id="settingsDownloadStories" /> <span>Stories</span></label>
               <label class="check-field"><input type="checkbox" id="settingsNotificationsEnabled" /> <span>Desktop Notifications</span></label>
+              <label class="check-field"><input type="checkbox" id="settingsIgnoreSystemProxy" /> <span>Ignore System Proxies for Instagram</span></label>
+            </div>
+            <div class="diag-card" id="networkDiagnosticsCard" data-level="idle">
+              <div class="diag-head">
+                <div class="diag-title" id="networkDiagTitle">Diagnostics Not Run Yet</div>
+                <button class="btn btn-sm btn-outline" onclick="runNetworkDiagnostics()">Run Diagnostics</button>
+              </div>
+              <div class="diag-copy" id="networkDiagSummary">Run diagnostics to compare the normal app network path against proxy bypass mode.</div>
+              <div class="diag-copy diag-sub" id="networkDiagProxySummary"></div>
+              <div class="diag-copy diag-sub" id="networkDiagCurrent"></div>
+              <div class="diag-copy diag-sub" id="networkDiagAlternate"></div>
+              <div class="diag-copy diag-reco" id="networkDiagRecommendation"></div>
             </div>
           </div>
           <div class="settings-actions">
@@ -998,8 +1043,10 @@ class WebServer: ObservableObject {
         document.getElementById('statProfiles').textContent = s.totalProfiles;
         document.getElementById('statActive').textContent = s.activeProfiles;
         document.getElementById('statMedia').textContent = s.totalMediaIndexed >= 1000 ? (s.totalMediaIndexed / 1000).toFixed(1) + 'K' : s.totalMediaIndexed;
-        document.getElementById('statStatus').textContent = s.isDownloading ? 'Downloading' : (s.instagramLoggedIn ? 'Ready' : 'Login Needed');
+        const networkNeedsAttention = !!(s.networkDiagnostics && s.networkDiagnostics.shouldWarnUser);
+        document.getElementById('statStatus').textContent = s.isDownloading ? 'Downloading' : (networkNeedsAttention ? 'Attention' : (s.instagramLoggedIn ? 'Ready' : 'Login Needed'));
         syncSessionState(s);
+        renderNetworkDiagnostics(s.networkDiagnostics);
       } catch {}
     }
 
@@ -1017,10 +1064,24 @@ class WebServer: ObservableObject {
         document.getElementById('settingsDownloadHighlights').checked = !!data.download_highlights;
         document.getElementById('settingsDownloadStories').checked = !!data.download_stories;
         document.getElementById('settingsNotificationsEnabled').checked = !!data.notifications_enabled;
+        document.getElementById('settingsIgnoreSystemProxy').checked = !!data.ignore_system_proxy_for_instagram;
         settingsLoaded = true;
       } catch {
         showToast('Could not load settings', 'error');
       }
+    }
+
+    function renderNetworkDiagnostics(diag) {
+      const card = document.getElementById('networkDiagnosticsCard');
+      if (!card || !diag) return;
+
+      card.dataset.level = diag.level || 'idle';
+      document.getElementById('networkDiagTitle').textContent = diag.title || 'Diagnostics Not Run Yet';
+      document.getElementById('networkDiagSummary').textContent = diag.summary || '';
+      document.getElementById('networkDiagProxySummary').textContent = diag.proxySummary || '';
+      document.getElementById('networkDiagCurrent').textContent = diag.currentProbe ? `Current mode: ${diag.currentProbe.detail}` : '';
+      document.getElementById('networkDiagAlternate').textContent = diag.alternateProbe ? `Alternate mode: ${diag.alternateProbe.detail}` : '';
+      document.getElementById('networkDiagRecommendation').textContent = diag.recommendation || '';
     }
 
     function syncSessionState(status) {
@@ -1050,6 +1111,7 @@ class WebServer: ObservableObject {
       panel.style.display = shouldOpen ? 'block' : 'none';
       if (shouldOpen) {
         loadSettings();
+        loadStatus();
       }
     }
 
@@ -1065,7 +1127,8 @@ class WebServer: ObservableObject {
         download_videos: document.getElementById('settingsDownloadVideos').checked,
         download_highlights: document.getElementById('settingsDownloadHighlights').checked,
         download_stories: document.getElementById('settingsDownloadStories').checked,
-        notifications_enabled: document.getElementById('settingsNotificationsEnabled').checked
+        notifications_enabled: document.getElementById('settingsNotificationsEnabled').checked,
+        ignore_system_proxy_for_instagram: document.getElementById('settingsIgnoreSystemProxy').checked
       };
 
       try {
@@ -1076,8 +1139,20 @@ class WebServer: ObservableObject {
         });
         showToast(data.message || 'Settings updated', 'success');
         loadStatus();
+        setTimeout(loadStatus, 1200);
       } catch {
         showToast('Failed to save settings', 'error');
+      }
+    }
+
+    async function runNetworkDiagnostics() {
+      try {
+        await apiRequest('/api/network/diagnostics', { method: 'POST' });
+        showToast('Running network diagnostics…', 'success');
+        loadStatus();
+        setTimeout(loadStatus, 1200);
+      } catch {
+        showToast('Could not run network diagnostics', 'error');
       }
     }
 

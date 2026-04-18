@@ -8,6 +8,7 @@ struct SettingsView: View {
     @ObservedObject private var settings = AppSettings.shared
     @ObservedObject private var webServer = WebServer.shared
     @ObservedObject private var updater = UpdateChecker.shared
+    @ObservedObject private var diagnostics = NetworkDiagnosticsService.shared
     @State private var showingFolderPicker = false
     @State private var showingLogin = false
 
@@ -177,6 +178,10 @@ struct SettingsView: View {
                         .controlSize(.small)
                     }
 
+                    settingsSection("Network") {
+                        networkSection
+                    }
+
                     // Updates
                     settingsSection("Updates") {
                         updatesSection
@@ -253,9 +258,12 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .frame(width: 520, height: 820)
+        .frame(width: 520, height: 920)
         .sheet(isPresented: $showingLogin) {
             InstagramLoginView()
+        }
+        .onAppear {
+            diagnostics.refreshIfStale()
         }
     }
 
@@ -269,6 +277,111 @@ struct SettingsView: View {
     }
 
     // MARK: - Updates section
+
+    @ViewBuilder
+    private var networkSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Toggle("Ignore system proxies for Instagram (advanced)", isOn: $settings.ignoreSystemProxyForInstagram)
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .onChange(of: settings.ignoreSystemProxyForInstagram) { _ in
+                    InstagramService.shared.refreshNetworkConfiguration()
+                    diagnostics.refresh()
+                }
+
+            Text("Use this only if a VPN, split tunneling rule, or proxy setting is still capturing InstaArchive traffic when it should be bypassed. This changes InstaArchive only and does not affect the rest of your Mac.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                Button(diagnostics.isRunning ? "Running…" : "Run Diagnostics") {
+                    diagnostics.refresh()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(diagnostics.isRunning)
+
+                if let suggestion = diagnostics.snapshot.suggestedIgnoreSystemProxies,
+                   suggestion != settings.ignoreSystemProxyForInstagram {
+                    Button("Use Recommended Mode") {
+                        settings.ignoreSystemProxyForInstagram = suggestion
+                        InstagramService.shared.refreshNetworkConfiguration()
+                        diagnostics.refresh()
+                    }
+                    .controlSize(.small)
+                }
+
+                Spacer()
+
+                if let checkedAt = diagnostics.snapshot.checkedAt {
+                    Text("Checked \(checkedAt.formatted(date: .abbreviated, time: .shortened))")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            networkStatusCard
+        }
+    }
+
+    @ViewBuilder
+    private var networkStatusCard: some View {
+        let snapshot = diagnostics.snapshot
+        let accentColor: Color = {
+            switch snapshot.level {
+            case .ok: return .green
+            case .warning: return .orange
+            case .error: return .red
+            case .idle: return .secondary
+            }
+        }()
+
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: snapshot.level == .ok ? "checkmark.circle.fill" : "network.badge.shield.half.filled")
+                    .foregroundColor(accentColor)
+                Text(snapshot.title)
+                    .font(.system(size: 13, weight: .medium))
+                Spacer()
+                if diagnostics.isRunning {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                }
+            }
+
+            Text(snapshot.summary)
+                .font(.system(size: 12))
+                .fixedSize(horizontal: false, vertical: true)
+
+            Text(snapshot.proxySummary)
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if let currentProbe = snapshot.currentProbe {
+                Text("Current mode: \(currentProbe.detail)")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            if let alternateProbe = snapshot.alternateProbe {
+                Text("Alternate mode: \(alternateProbe.detail)")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+
+            if let recommendation = snapshot.recommendation {
+                Text(recommendation)
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(accentColor)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(10)
+        .background(accentColor.opacity(0.08))
+        .cornerRadius(8)
+    }
 
     @ViewBuilder
     private var updatesSection: some View {
