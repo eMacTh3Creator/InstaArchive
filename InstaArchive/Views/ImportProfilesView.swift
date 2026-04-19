@@ -11,6 +11,7 @@ struct ImportProfilesView: View {
     @State private var selectedFileName: String?
     @State private var statusMessage: String?
     @State private var errorMessage: String?
+    @State private var dismissTask: Task<Void, Never>?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -87,15 +88,23 @@ struct ImportProfilesView: View {
             Divider()
 
             HStack {
+                Text("This window closes automatically after a successful import.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
                 Spacer()
-                Button("Done") {
-                    dismiss()
+                Button("Close") {
+                    closeSheet()
                 }
-                .keyboardShortcut(.defaultAction)
+                .keyboardShortcut(.cancelAction)
+                .disabled(isImporting)
             }
             .padding(20)
         }
         .frame(width: 480, height: 360)
+        .onDisappear {
+            dismissTask?.cancel()
+            dismissTask = nil
+        }
     }
 
     private var dropZone: some View {
@@ -210,6 +219,7 @@ struct ImportProfilesView: View {
     }
 
     private func importProfiles(from url: URL) {
+        dismissTask?.cancel()
         isImporting = true
         selectedFileName = url.lastPathComponent
         statusMessage = nil
@@ -232,10 +242,25 @@ struct ImportProfilesView: View {
             } else {
                 statusMessage = "Import finished. Added \(added) new profiles."
             }
+            scheduleAutoDismiss()
         } catch {
             errorMessage = error.localizedDescription
         }
 
         isImporting = false
+    }
+
+    private func scheduleAutoDismiss() {
+        dismissTask?.cancel()
+        dismissTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 700_000_000)
+            guard !Task.isCancelled else { return }
+            dismiss()
+        }
+    }
+
+    private func closeSheet() {
+        dismissTask?.cancel()
+        dismiss()
     }
 }
