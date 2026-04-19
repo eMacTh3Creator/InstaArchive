@@ -10,6 +10,24 @@ class SchedulerService: ObservableObject {
     @Published var nextCheckDate: Date?
     @Published var isSchedulerActive = false
 
+    /// When set to a future date, the scheduler tick skips without firing any
+    /// checks. Persisted to UserDefaults so pauses survive app restarts.
+    /// Set by the Stop button (24 h default) and cleared either manually via
+    /// `resume()` or automatically once the date passes.
+    @Published var pausedUntil: Date? {
+        didSet {
+            if let date = pausedUntil {
+                UserDefaults.standard.set(date.timeIntervalSince1970, forKey: Keys.pauseUntil)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Keys.pauseUntil)
+            }
+        }
+    }
+
+    private enum Keys {
+        static let pauseUntil = "schedulerPauseUntil"
+    }
+
     /// Fires every 60 seconds to check if any profile is due
     private var timer: Timer?
     private let settings = AppSettings.shared
@@ -17,7 +35,42 @@ class SchedulerService: ObservableObject {
     private let log = Logger.shared
 
     private init() {
+        // Restore persisted pause state (ignore if already expired)
+        if let ts = UserDefaults.standard.object(forKey: Keys.pauseUntil) as? TimeInterval {
+            let date = Date(timeIntervalSince1970: ts)
+            if date > Date() {
+                pausedUntil = date
+            } else {
+                UserDefaults.standard.removeObject(forKey: Keys.pauseUntil)
+            }
+        }
         requestNotificationPermission()
+    }
+
+    // MARK: - Pause / Resume
+
+    /// Pause the scheduler for the given duration (default 24 hours).
+    /// Any in-flight batch continues — this only prevents future ticks from
+    /// firing new ones. Survives app restarts.
+    func pause(for duration: TimeInterval = 24 * 3600) {
+        let until = Date().addingTimeInterval(duration)
+        pausedUntil = until
+        log.info("Scheduler paused until \(until.formatted(date: .abbreviated, time: .shortened))", context: "scheduler")
+    }
+
+    /// Clear any active pause so the next tick fires normally.
+    func resume() {
+        guard pausedUntil != nil else { return }
+        pausedUntil = nil
+        log.info("Scheduler resumed by user", context: "scheduler")
+    }
+
+    /// Human-readable pause description for UI. Nil when not paused.
+    var pausedDescription: String? {
+        guard let until = pausedUntil, until > Date() else { return nil }
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .full
+        return "Paused — resumes \(formatter.localizedString(for: until, relativeTo: Date()))"
     }
 
     // MARK: - Scheduling
@@ -64,9 +117,26 @@ class SchedulerService: ObservableObject {
 
     /// Called every 60 seconds. Checks which profiles are due and syncs them.
     private func tick(profileStore: ProfileStore) async {
+        // Auto-clear expired pause.
+        if let until = pausedUntil, until <= Date() {
+            await MainActor.run { self.pausedUntil = nil }
+            log.info("Scheduler pause expired — resuming normal checks", context: "scheduler")
+        }
+
+        // Skip tick entirely if paused.
+        if let until = pausedUntil, until > Date() {
+            await MainActor.run {
+                self.updateNextCheckDate(profileStore: profileStore)
+            }
+            return
+        }
+
         let dueProfiles = profileStore.profiles.filter { $0.isDue() }
 
-        if !dueProfiles.isEmpty && !downloadManager.isRunning {
+        // Use `isBatchInProgress` (not `isRunning`) — `isRunning` flickers off
+        // during per-profile cooldowns, which before v1.6.4 let this tick fire
+        // concurrent waves that piled up into a thundering-herd block.
+        if !dueProfiles.isEmpty && !downloadManager.isBatchInProgress {
             log.info("Scheduler: \(dueProfiles.count) profile(s) due for check", context: "scheduler")
             await performScheduledCheck(profiles: dueProfiles, profileStore: profileStore)
         }
@@ -86,15 +156,16 @@ class SchedulerService: ObservableObject {
         // scheduler does not blast a large number of profiles in parallel.
         downloadManager.checkProfiles(profiles, profileStore: profileStore)
 
-        // The batch starts on a detached task, so give it a brief window to
-        // flip into the running state before we begin polling for completion.
+        // Poll `isBatchInProgress` — unlike `isRunning` this stays true during
+        // per-profile cooldown sleeps, so we correctly wait for the whole batch
+        // to finish instead of exiting after the first profile and letting the
+        // next tick queue a concurrent wave.
         let startDeadline = Date().addingTimeInterval(5)
-        while !downloadManager.isRunning && Date() < startDeadline {
+        while !downloadManager.isBatchInProgress && Date() < startDeadline {
             try? await Task.sleep(nanoseconds: 200_000_000)
         }
 
-        // Wait for downloads to finish (polling every 2s)
-        while downloadManager.isRunning {
+        while downloadManager.isBatchInProgress {
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
 

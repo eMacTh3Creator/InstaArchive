@@ -441,6 +441,7 @@ struct SidebarBottomBar: View {
     @State private var isRunning = false
     @State private var activityText: String = ""
     @State private var activeCount: Int = 0
+    @State private var pausedDescription: String?
     @State private var pollTimer: Timer?
 
     var body: some View {
@@ -461,6 +462,17 @@ struct SidebarBottomBar: View {
                             .foregroundColor(.secondary.opacity(0.7))
                     }
                 }
+            } else if let paused = pausedDescription {
+                HStack(spacing: 4) {
+                    Image(systemName: "pause.circle.fill")
+                        .foregroundColor(.orange)
+                        .font(.system(size: 11))
+                    Text(paused)
+                        .font(.system(size: 10))
+                        .foregroundColor(.orange)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
             } else {
                 Text("\(profileCount) profile\(profileCount == 1 ? "" : "s")")
                     .font(.system(size: 11))
@@ -468,13 +480,27 @@ struct SidebarBottomBar: View {
             }
             Spacer()
             if isRunning {
-                Button(action: { DownloadManager.shared.stopAll() }) {
+                Button(action: {
+                    DownloadManager.shared.stopAll()
+                    // Pause the scheduler so it doesn't re-queue everything in
+                    // the next 60-second tick. Default 24 h — user can tap
+                    // Resume in the sidebar if they want to re-enable sooner.
+                    SchedulerService.shared.pause()
+                }) {
                     Image(systemName: "stop.fill")
                         .font(.system(size: 10))
                         .foregroundColor(.red)
                 }
                 .buttonStyle(.plain)
-                .help("Stop All Downloads")
+                .help("Stop all downloads and pause scheduler for 24 hours")
+            } else if pausedDescription != nil {
+                Button(action: { SchedulerService.shared.resume() }) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 10))
+                        .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.plain)
+                .help("Resume scheduler")
             }
             Button(action: onCheckAll) {
                 Image(systemName: "arrow.clockwise")
@@ -510,6 +536,7 @@ struct SidebarBottomBar: View {
         isRunning = dm.isRunning
         activityText = dm.currentActivity
         activeCount = dm.activeUsernames.count
+        pausedDescription = SchedulerService.shared.pausedDescription
     }
 }
 

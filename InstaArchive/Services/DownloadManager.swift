@@ -58,6 +58,13 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
     private var _currentActivity: String = ""
     private var _totalNewItems: Int = 0
     private var _activeUsernames: Set<String> = []
+    /// Counter for active batch operations (checkProfiles / checkAllProfiles /
+    /// refreshProfiles). Unlike `_isRunning` which flickers off during
+    /// per-profile cooldowns (when `_activeUsernames` is momentarily empty),
+    /// this stays > 0 for the entire batch lifetime including cooldowns. The
+    /// scheduler uses this to avoid firing concurrent waves during cooldown
+    /// gaps — the v1.6.3 bug where 183 parallel waves accumulated.
+    private var _batchCount = 0
 
     // Thread-safe accessors for UI polling
     var profileStatuses: [String: DownloadStatus] {
@@ -69,6 +76,14 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         return _isRunning
+    }
+    /// True if any batch operation is currently in progress, INCLUDING during
+    /// the cooldown sleep between profiles. The scheduler must use this (not
+    /// `isRunning`) to decide whether to skip a tick.
+    var isBatchInProgress: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _batchCount > 0
     }
     var currentActivity: String {
         stateLock.lock()
@@ -147,6 +162,26 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         _activeUsernames.removeAll()
         _isRunning = false
         _currentActivity = ""
+        _batchCount = 0
+        stateLock.unlock()
+    }
+
+    /// Call at the very start of a batch detached task. Pair with `markBatchFinished`
+    /// via `defer` so the count is always balanced even if the task throws.
+    private func markBatchStarted() {
+        stateLock.lock()
+        _batchCount += 1
+        _isRunning = true
+        stateLock.unlock()
+    }
+
+    private func markBatchFinished() {
+        stateLock.lock()
+        _batchCount = max(0, _batchCount - 1)
+        if _batchCount == 0 && _activeUsernames.isEmpty {
+            _isRunning = false
+            _currentActivity = ""
+        }
         stateLock.unlock()
     }
 
@@ -309,8 +344,17 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         let queuedProfiles = profiles.filter { !active.contains($0.username) }
         guard !queuedProfiles.isEmpty else { return }
 
+        // Don't start a second batch if one is already running — prevents the
+        // scheduler from stacking multiple concurrent waves during cooldown gaps.
+        guard !isBatchInProgress else {
+            log.info("checkProfiles: skipping — batch already in progress", context: "scheduler")
+            return
+        }
+        markBatchStarted()
+
         let shuffled = queuedProfiles.shuffled()
         checkAllTask = Task.detached(priority: .userInitiated) { [self] in
+            defer { self.markBatchFinished() }
             for (index, profile) in shuffled.enumerated() {
                 if stopAllRequested || Task.isCancelled { break }
                 await self.performCheck(profile, profileStore: profileStore)
@@ -320,7 +364,6 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                     try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
                 }
             }
-            self.markAllStopped()
         }
     }
 
@@ -330,7 +373,10 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         )
         guard !uniqueProfiles.isEmpty else { return }
 
+        markBatchStarted()
+
         Task.detached(priority: .userInitiated) { [self] in
+            defer { self.markBatchFinished() }
             let refreshableProfiles = uniqueProfiles.filter { !activeUsernames.contains($0.username) }
             guard !refreshableProfiles.isEmpty else { return }
 
@@ -715,9 +761,16 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         let activeProfiles = profileStore.profiles.filter { $0.isActive }
         guard !activeProfiles.isEmpty else { return }
 
+        guard !isBatchInProgress else {
+            log.info("checkAllProfiles: skipping — batch already in progress", context: "scheduler")
+            return
+        }
+        markBatchStarted()
+
         let shuffledProfiles = activeProfiles.shuffled()
 
         checkAllTask = Task.detached(priority: .userInitiated) { [self] in
+            defer { self.markBatchFinished() }
             let profiles = shuffledProfiles
             let batchSize = 10
             var completedInBatch = 0
@@ -745,8 +798,6 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                     try? await Task.sleep(nanoseconds: UInt64(cooldown * 1_000_000_000))
                 }
             }
-
-            self.markAllStopped()
         }
     }
 
