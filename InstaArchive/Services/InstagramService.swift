@@ -169,8 +169,10 @@ class InstagramService {
     private var lastRequestTime: Date?
     private let rateLock = NSLock()
     private let minimumRequestInterval: TimeInterval = 5.0
+    private let hourlyRequestBudget = 100
     private var requestCount: Int = 0
     private var hourWindowStart: Date = Date()
+    private var nextAllowedRequestTime: Date = Date()
     private var paginationDepth: Int = 0  // Tracks how deep into pagination we are
 
     // Session state
@@ -511,28 +513,109 @@ class InstagramService {
         igWWWClaim = "0"
     }
 
+    private func shouldRetryAuthenticatedRequest(statusCode: Int) -> Bool {
+        [400, 401, 403].contains(statusCode)
+    }
+
+    /// Refresh the browser-like session context that Instagram expects for web API calls.
+    /// This is lighter than a full logout/login and helps recover when feed requests start
+    /// returning 400/401 due to a stale CSRF token or rotated claim header.
+    private func refreshSessionContext(after reason: String) async {
+        await waitForRateLimit()
+
+        guard let url = URL(string: baseURL + "/") else { return }
+
+        var request = URLRequest(url: url)
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", forHTTPHeaderField: "Accept")
+        request.setValue("document", forHTTPHeaderField: "Sec-Fetch-Dest")
+        request.setValue("navigate", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("none", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("?1", forHTTPHeaderField: "Sec-Fetch-User")
+        request.setValue("1", forHTTPHeaderField: "Upgrade-Insecure-Requests")
+
+        do {
+            let (_, response) = try await session.data(for: request)
+
+            if let httpResponse = response as? HTTPURLResponse,
+               let responseURL = httpResponse.url {
+                let cookies = HTTPCookieStorage.shared.cookies(for: responseURL) ?? []
+                for cookie in cookies {
+                    if cookie.name == "csrftoken", !cookie.value.isEmpty {
+                        csrfToken = cookie.value
+                    }
+                }
+
+                if csrfToken == nil,
+                   let allHeaders = httpResponse.allHeaderFields as? [String: String] {
+                    let responseCookies = HTTPCookie.cookies(withResponseHeaderFields: allHeaders, for: responseURL)
+                    for cookie in responseCookies {
+                        if cookie.name == "csrftoken", !cookie.value.isEmpty {
+                            csrfToken = cookie.value
+                            HTTPCookieStorage.shared.setCookie(cookie)
+                        }
+                    }
+                }
+
+                captureClaimFromResponse(response)
+            }
+
+            if csrfToken == nil {
+                csrfToken = generateCSRFToken()
+            }
+
+            let allCookies = HTTPCookieStorage.shared.cookies ?? []
+            let isAuthenticated = allCookies.contains {
+                $0.name == "sessionid" && $0.domain.contains("instagram") && !$0.value.isEmpty
+            }
+            sessionInitialized = true
+
+            log.info(
+                "Refreshed Instagram session context after \(reason) (authenticated: \(isAuthenticated), claim: \(igWWWClaim != "0" ? "yes" : "no"))",
+                context: "session"
+            )
+        } catch {
+            log.warn("Failed to refresh Instagram session context after \(reason): \(error.localizedDescription)", context: "session")
+        }
+    }
+
     // MARK: - Rate Limiting
 
-    /// Read and update rate limit state atomically. Returns (lastRequest, hourlyCount).
-    private func rateLimitState() -> (lastRequest: Date?, hourlyCount: Int) {
+    /// Reserve a unique send slot so concurrent callers cannot burst together.
+    /// Also enforces a hard hourly budget by moving excess callers into the next window.
+    private func reserveRequestSlot(effectiveInterval: TimeInterval) -> (delay: TimeInterval, hourlyCount: Int, rolloverDelay: TimeInterval?) {
         rateLock.lock()
         defer { rateLock.unlock() }
+
         let now = Date()
+
         if now.timeIntervalSince(hourWindowStart) > 3600 {
             requestCount = 0
             hourWindowStart = now
+            nextAllowedRequestTime = max(nextAllowedRequestTime, now)
         }
-        requestCount += 1
-        let last = lastRequestTime
-        let count = requestCount
-        return (last, count)
-    }
 
-    /// Mark a request as sent (thread-safe).
-    private func markRequestSent() {
-        rateLock.lock()
-        lastRequestTime = Date()
-        rateLock.unlock()
+        var scheduledTime = max(now, nextAllowedRequestTime)
+
+        // If we have already queued into a future hour window, reopen the budget there.
+        if scheduledTime.timeIntervalSince(hourWindowStart) > 3600 {
+            requestCount = 0
+            hourWindowStart = scheduledTime
+        }
+
+        var rolloverDelay: TimeInterval?
+        if requestCount >= hourlyRequestBudget {
+            let resetAt = hourWindowStart.addingTimeInterval(3600)
+            rolloverDelay = max(0, resetAt.timeIntervalSince(now))
+            scheduledTime = max(scheduledTime, resetAt)
+            requestCount = 0
+            hourWindowStart = scheduledTime
+        }
+
+        requestCount += 1
+        nextAllowedRequestTime = scheduledTime.addingTimeInterval(effectiveInterval)
+        lastRequestTime = scheduledTime
+
+        return (max(0, scheduledTime.timeIntervalSince(now)), requestCount, rolloverDelay)
     }
 
     /// Thread-safe rate limiter with human-like jitter and hourly budget.
@@ -556,24 +639,23 @@ class InstagramService {
         let depthMultiplier = 1.0 + Double(min(paginationDepth, 10)) * 0.1
         let effectiveInterval = (minimumRequestInterval + jitter) * depthMultiplier
 
-        let (last, currentCount) = rateLimitState()
+        let reservation = reserveRequestSlot(effectiveInterval: effectiveInterval)
 
-        // If approaching hourly limit, add aggressive progressive backoff
-        if currentCount > 100 {
-            let extraDelay = Double(currentCount - 100) * 3.0
-            log.warn("Approaching hourly request limit (\(currentCount)/120), adding \(Int(extraDelay))s cooldown", context: "rate")
-            try? await Task.sleep(nanoseconds: UInt64(extraDelay * 1_000_000_000))
+        if let rolloverDelay = reservation.rolloverDelay {
+            log.warn(
+                "Hit hourly Instagram request budget (\(hourlyRequestBudget)/\(hourlyRequestBudget)); pausing \(Int(rolloverDelay))s before continuing",
+                context: "rate"
+            )
+        } else if reservation.hourlyCount >= Int(Double(hourlyRequestBudget) * 0.85) {
+            log.warn(
+                "Approaching hourly Instagram request budget (\(reservation.hourlyCount)/\(hourlyRequestBudget))",
+                context: "rate"
+            )
         }
 
-        if let last = last {
-            let elapsed = Date().timeIntervalSince(last)
-            if elapsed < effectiveInterval {
-                let delay = effectiveInterval - elapsed
-                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-            }
+        if reservation.delay > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(reservation.delay * 1_000_000_000))
         }
-
-        markRequestSent()
     }
 
     // MARK: - Response Validation
@@ -1439,7 +1521,11 @@ class InstagramService {
     // MARK: - Stories
 
     /// Fetch stories for a public profile
-    func fetchStories(userId: String, username: String) async throws -> [DiscoveredMedia] {
+    func fetchStories(
+        userId: String,
+        username: String,
+        allowRecovery: Bool = true
+    ) async throws -> [DiscoveredMedia] {
         try await ensureSession()
         await waitForRateLimit()
 
@@ -1451,8 +1537,24 @@ class InstagramService {
 
         let (data, response) = try await session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            log.warn("Stories API returned status \((response as? HTTPURLResponse)?.statusCode ?? 0) for @\(username)", context: "stories")
+        guard let httpResponse = response as? HTTPURLResponse else {
+            if allowRecovery {
+                log.warn("Stories API returned a non-HTTP response for @\(username), refreshing session context and retrying once", context: "stories")
+                await refreshSessionContext(after: "stories non-HTTP response for @\(username)")
+                return try await fetchStories(userId: userId, username: username, allowRecovery: false)
+            }
+            log.warn("Stories API returned a non-HTTP response for @\(username)", context: "stories")
+            // Try GraphQL fallback
+            return try await fetchStoriesViaGraphQL(userId: userId, username: username)
+        }
+
+        guard httpResponse.statusCode == 200 else {
+            if allowRecovery && shouldRetryAuthenticatedRequest(statusCode: httpResponse.statusCode) {
+                log.warn("Stories API returned status \(httpResponse.statusCode) for @\(username), refreshing session context and retrying once", context: "stories")
+                await refreshSessionContext(after: "stories HTTP \(httpResponse.statusCode) for @\(username)")
+                return try await fetchStories(userId: userId, username: username, allowRecovery: false)
+            }
+            log.warn("Stories API returned status \(httpResponse.statusCode) for @\(username)", context: "stories")
             // Try GraphQL fallback
             return try await fetchStoriesViaGraphQL(userId: userId, username: username)
         }
@@ -1606,20 +1708,38 @@ class InstagramService {
     }
 
     /// Get the list of highlight reel IDs for a user
-    private func fetchHighlightReelIds(userId: String) async throws -> [String] {
+    private func fetchHighlightReelIds(
+        userId: String,
+        allowRecovery: Bool = true
+    ) async throws -> [String] {
         // Try v1 API first
         let urlString = "\(baseURL)/api/v1/highlights/\(userId)/highlights_tray/"
         if let url = URL(string: urlString) {
             let request = makeAPIRequest(url: url)
-            if let (data, response) = try? await session.data(for: request),
-               let httpResponse = response as? HTTPURLResponse,
-               httpResponse.statusCode == 200,
-               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let tray = json["tray"] as? [[String: Any]] {
-                return tray.compactMap { item -> String? in
-                    if let id = item["id"] as? String { return id }
-                    if let id = item["id"] as? Int64 { return String(id) }
-                    return nil
+            do {
+                let (data, response) = try await session.data(for: request)
+                if let httpResponse = response as? HTTPURLResponse {
+                    if httpResponse.statusCode == 200,
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let tray = json["tray"] as? [[String: Any]] {
+                        return tray.compactMap { item -> String? in
+                            if let id = item["id"] as? String { return id }
+                            if let id = item["id"] as? Int64 { return String(id) }
+                            return nil
+                        }
+                    }
+
+                    if allowRecovery && shouldRetryAuthenticatedRequest(statusCode: httpResponse.statusCode) {
+                        log.warn("Highlights tray API returned status \(httpResponse.statusCode) for user \(userId), refreshing session context and retrying once", context: "highlights")
+                        await refreshSessionContext(after: "highlights tray HTTP \(httpResponse.statusCode) for user \(userId)")
+                        return try await fetchHighlightReelIds(userId: userId, allowRecovery: false)
+                    }
+                }
+            } catch {
+                if allowRecovery {
+                    log.warn("Highlights tray API request failed for user \(userId), refreshing session context and retrying once: \(error.localizedDescription)", context: "highlights")
+                    await refreshSessionContext(after: "highlights tray request error for user \(userId)")
+                    return try await fetchHighlightReelIds(userId: userId, allowRecovery: false)
                 }
             }
         }
@@ -1671,7 +1791,11 @@ class InstagramService {
     }
 
     /// Fetch the actual media items within a highlight reel
-    private func fetchHighlightReelItems(highlightId: String, username: String) async throws -> [DiscoveredMedia] {
+    private func fetchHighlightReelItems(
+        highlightId: String,
+        username: String,
+        allowRecovery: Bool = true
+    ) async throws -> [DiscoveredMedia] {
         await waitForRateLimit()
 
         // v1 API to fetch reel items
@@ -1683,7 +1807,22 @@ class InstagramService {
 
         let (data, response) = try await session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            if allowRecovery {
+                log.warn("Highlight reel API returned a non-HTTP response for @\(username), refreshing session context and retrying once", context: "highlights")
+                await refreshSessionContext(after: "highlight reel non-HTTP response for @\(username)")
+                return try await fetchHighlightReelItems(highlightId: highlightId, username: username, allowRecovery: false)
+            }
+            // Try the GraphQL approach for this specific highlight
+            return try await fetchHighlightReelItemsViaGraphQL(highlightId: highlightId, username: username)
+        }
+
+        guard httpResponse.statusCode == 200 else {
+            if allowRecovery && shouldRetryAuthenticatedRequest(statusCode: httpResponse.statusCode) {
+                log.warn("Highlight reel API returned status \(httpResponse.statusCode) for @\(username), refreshing session context and retrying once", context: "highlights")
+                await refreshSessionContext(after: "highlight reel HTTP \(httpResponse.statusCode) for @\(username)")
+                return try await fetchHighlightReelItems(highlightId: highlightId, username: username, allowRecovery: false)
+            }
             // Try the GraphQL approach for this specific highlight
             return try await fetchHighlightReelItemsViaGraphQL(highlightId: highlightId, username: username)
         }
@@ -1799,7 +1938,11 @@ class InstagramService {
 
     // MARK: - Fetch Media (single page, internal)
 
-    private func fetchMediaViaAPI(username: String, cursor: String?) async throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+    private func fetchMediaViaAPI(
+        username: String,
+        cursor: String?,
+        allowRecovery: Bool = true
+    ) async throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
         await waitForRateLimit()
 
         let userId = try await getUserId(for: username)
@@ -1822,19 +1965,46 @@ class InstagramService {
             let (data, response) = try await session.data(for: request)
             captureClaimFromResponse(response)
 
-            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            guard let httpResponse = response as? HTTPURLResponse else {
+                if allowRecovery {
+                    await refreshSessionContext(after: "non-HTTP feed response for @\(username)")
+                    return try await fetchMediaViaAPI(username: username, cursor: cursor, allowRecovery: false)
+                }
+                log.warn("Authenticated feed API returned a non-HTTP response for @\(username), trying public feed fallback", context: "api")
+                return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
+            }
+
+            guard httpResponse.statusCode == 200 else {
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-                log.warn("Authenticated feed API returned status \(statusCode) for @\(username), trying public feed fallback", context: "api")
+                let preview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary data)"
+                if allowRecovery && shouldRetryAuthenticatedRequest(statusCode: statusCode) {
+                    log.warn("Authenticated feed API returned status \(statusCode) for @\(username), refreshing session context and retrying once. Preview: \(preview)", context: "api")
+                    await refreshSessionContext(after: "feed HTTP \(statusCode) for @\(username)")
+                    return try await fetchMediaViaAPI(username: username, cursor: cursor, allowRecovery: false)
+                }
+                log.warn("Authenticated feed API returned status \(statusCode) for @\(username), trying public feed fallback. Preview: \(preview)", context: "api")
                 return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
             }
 
             do {
+                try validateAPIResponse(data: data, response: httpResponse, context: "fetchMediaViaAPI(@\(username))")
                 return try parseV1FeedResponse(from: data, username: username)
             } catch {
+                if allowRecovery,
+                   case InstagramError.sessionError = error {
+                    log.warn("Authenticated feed returned session HTML for @\(username), refreshing session context and retrying once", context: "api")
+                    await refreshSessionContext(after: "feed HTML response for @\(username)")
+                    return try await fetchMediaViaAPI(username: username, cursor: cursor, allowRecovery: false)
+                }
                 log.warn("Authenticated feed parse failed for @\(username), trying public feed fallback", context: "api")
                 return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
             }
         } catch {
+            if allowRecovery {
+                log.warn("Authenticated feed request failed for @\(username), refreshing session context and retrying once: \(error.localizedDescription)", context: "api")
+                await refreshSessionContext(after: "feed request error for @\(username)")
+                return try await fetchMediaViaAPI(username: username, cursor: cursor, allowRecovery: false)
+            }
             log.warn("Authenticated feed request failed for @\(username), trying public feed fallback: \(error.localizedDescription)", context: "api")
             return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
         }

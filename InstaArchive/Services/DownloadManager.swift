@@ -304,7 +304,12 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
 
     /// Sync a batch of specific profiles (for multi-select).
     func checkProfiles(_ profiles: [Profile], profileStore: ProfileStore) {
-        let shuffled = profiles.shuffled()
+        stopAllRequested = false
+        let active = activeUsernames
+        let queuedProfiles = profiles.filter { !active.contains($0.username) }
+        guard !queuedProfiles.isEmpty else { return }
+
+        let shuffled = queuedProfiles.shuffled()
         checkAllTask = Task.detached(priority: .userInitiated) { [self] in
             for (index, profile) in shuffled.enumerated() {
                 if stopAllRequested || Task.isCancelled { break }
@@ -362,10 +367,8 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 profileStore.saveAll()
             }
 
-            for profile in refreshableProfiles {
-                clearStatus(for: profile.username)
-                checkProfile(profile, profileStore: profileStore)
-            }
+            refreshableProfiles.forEach { clearStatus(for: $0.username) }
+            checkProfiles(refreshableProfiles, profileStore: profileStore)
         }
     }
 

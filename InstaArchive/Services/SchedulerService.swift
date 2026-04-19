@@ -82,10 +82,9 @@ class SchedulerService: ObservableObject {
     private func performScheduledCheck(profiles: [Profile], profileStore: ProfileStore) async {
         log.info("Running scheduled check for \(profiles.count) profile(s)...", context: "scheduler")
 
-        // Queue each due profile individually
-        for profile in profiles {
-            downloadManager.checkProfile(profile, profileStore: profileStore)
-        }
+        // Run the batch through DownloadManager's sequential queue so the
+        // scheduler does not blast a large number of profiles in parallel.
+        downloadManager.checkProfiles(profiles, profileStore: profileStore)
 
         // Wait for downloads to finish (polling every 2s)
         while downloadManager.isRunning {
