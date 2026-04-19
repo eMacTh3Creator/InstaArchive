@@ -178,6 +178,7 @@ class InstagramService {
     private var igWWWClaim: String = "0"   // X-IG-WWW-Claim header (0 = logged out)
     private var sessionInitialized = false
     private var cachedUserIds: [String: String] = [:]
+    private var cachedPublicProfilePages: [String: (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool)] = [:]
 
     /// Whether CDN URL upgrades (stripping size constraints from the `stp`
     /// query param) work for this session. Three states:
@@ -216,9 +217,11 @@ class InstagramService {
             config.httpCookieStorage = HTTPCookieStorage.shared
             config.httpShouldSetCookies = true
         } else {
-            config.httpCookieAcceptPolicy = .never
-            config.httpCookieStorage = nil
-            config.httpShouldSetCookies = false
+            config.httpCookieAcceptPolicy = .always
+            config.httpShouldSetCookies = true
+            if !ephemeral {
+                config.httpCookieStorage = nil
+            }
         }
         // NOTE: Do NOT set Accept-Encoding here. URLSession handles gzip/deflate
         // decompression automatically, but ONLY if you don't override Accept-Encoding.
@@ -652,7 +655,7 @@ class InstagramService {
 
     private func makePublicAPIRequest(url: URL, referer: String? = nil) -> URLRequest {
         var request = makeAPIRequest(url: url, referer: referer)
-        request.httpShouldHandleCookies = false
+        request.httpShouldHandleCookies = true
         request.setValue("0", forHTTPHeaderField: "X-IG-WWW-Claim")
         if (request.value(forHTTPHeaderField: "X-CSRFToken") ?? "").isEmpty {
             request.setValue("public", forHTTPHeaderField: "X-CSRFToken")
@@ -811,7 +814,9 @@ class InstagramService {
         switch httpResponse.statusCode {
         case 200:
             try validateAPIResponse(data: data, response: httpResponse, context: "fetchPublicProfileInfo(@\(username))")
-            return try parseProfileInfo(from: data)
+            let info = try parseProfileInfo(from: data)
+            cachePublicProfileTimelinePage(from: data, username: username)
+            return info
         case 404:
             throw InstagramError.profileNotFound
         case 429:
@@ -843,6 +848,70 @@ class InstagramService {
             log.warn("Public metadata fallback failed for @\(username) after \(reason): \(error.localizedDescription)", context: "api")
             return nil
         }
+    }
+
+    private func cachePublicProfileTimelinePage(from data: Data, username: String) {
+        guard let page = try? parseProfileTimelinePageFromProfileInfo(data, username: username),
+              !page.media.isEmpty else { return }
+
+        cachedPublicProfilePages[username] = page
+        log.info(
+            "Cached \(page.media.count) latest posts from public profile metadata for @\(username) (hasMore=\(page.hasMore), nextCursor=\(shortCursor(page.nextCursor)))",
+            context: "api"
+        )
+    }
+
+    private func parseProfileTimelinePageFromProfileInfo(
+        _ data: Data,
+        username: String
+    ) throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw InstagramError.parsingError("Public profile metadata was not valid JSON")
+        }
+
+        let user =
+            (json["data"] as? [String: Any])?["user"] as? [String: Any]
+            ?? json["user"] as? [String: Any]
+            ?? (json["graphql"] as? [String: Any])?["user"] as? [String: Any]
+
+        guard let timelineConnection = user?["edge_owner_to_timeline_media"] as? [String: Any] else {
+            throw InstagramError.parsingError("Public profile metadata did not include timeline media")
+        }
+
+        return try parseTimelineConnection(timelineConnection, username: username)
+    }
+
+    private func fallbackToPublicProfileMetadata(
+        username: String,
+        cursor: String?
+    ) async throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+        if let cursor, !cursor.isEmpty {
+            log.warn(
+                "Public profile metadata fallback has no cursor pagination support for @\(username) (cursor=\(shortCursor(cursor))); stopping with items collected so far",
+                context: "api"
+            )
+            return ([], nil, false)
+        }
+
+        if let cached = cachedPublicProfilePages[username], !cached.media.isEmpty {
+            log.info("Recovered latest posts for @\(username) via cached public profile metadata", context: "api")
+            return cached
+        }
+
+        _ = try await fetchPublicProfileInfo(username: username, applyRateLimit: false)
+
+        if let cached = cachedPublicProfilePages[username], !cached.media.isEmpty {
+            log.info("Recovered latest posts for @\(username) via fresh public profile metadata", context: "api")
+            return cached
+        }
+
+        throw InstagramError.parsingError("Public profile metadata did not include media edges")
+    }
+
+    private func shortCursor(_ cursor: String?) -> String {
+        guard let cursor, !cursor.isEmpty else { return "nil" }
+        if cursor.count <= 24 { return cursor }
+        return "\(cursor.prefix(24))..."
     }
 
     private func parseProfileInfo(from data: Data) throws -> InstagramProfileInfo {
@@ -1166,6 +1235,10 @@ class InstagramService {
         while hasMore {
             let result: (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool)
             do {
+                log.info(
+                    "Requesting page \(allMedia.count / 33 + 1) for @\(username) (cursor=\(shortCursor(cursor)), strategy=\(workingStrategy ?? "auto"))",
+                    context: "media"
+                )
                 result = try await fetchRecentMedia(username: username, after: cursor)
             } catch {
                 log.warn("fetchRecentMedia failed on page \(allMedia.count / 33 + 1): \(error.localizedDescription)", context: "media")
@@ -1751,14 +1824,25 @@ class InstagramService {
         let request = makePublicAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
         let (data, response) = try await publicSession.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
-            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            log.warn("Public feed API returned status \(statusCode) for @\(username)", context: "api")
-            throw InstagramError.networkError(URLError(.badServerResponse))
+        guard let httpResponse = response as? HTTPURLResponse else {
+            log.warn("Public feed API returned a non-HTTP response for @\(username), trying public profile metadata fallback", context: "api")
+            return try await fallbackToPublicProfileMetadata(username: username, cursor: cursor)
         }
 
-        log.info("Recovered posts for @\(username) via clean public session", context: "api")
-        return try parseV1FeedResponse(from: data, username: username)
+        guard httpResponse.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+            let preview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary data)"
+            log.warn("Public feed API returned status \(statusCode) for @\(username). Preview: \(preview)", context: "api")
+            return try await fallbackToPublicProfileMetadata(username: username, cursor: cursor)
+        }
+
+        do {
+            log.info("Recovered posts for @\(username) via isolated public feed session", context: "api")
+            return try parseV1FeedResponse(from: data, username: username)
+        } catch {
+            log.warn("Public feed parse failed for @\(username): \(error.localizedDescription). Trying public profile metadata fallback", context: "api")
+            return try await fallbackToPublicProfileMetadata(username: username, cursor: cursor)
+        }
     }
 
     private func parseV1FeedResponse(from data: Data, username: String) throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
@@ -1889,29 +1973,25 @@ class InstagramService {
             throw InstagramError.parsingError("Unexpected GraphQL response structure")
         }
 
-        guard let media = timelineMedia,
-              let edges = media["edges"] as? [[String: Any]] else {
+        guard let media = timelineMedia else {
             throw InstagramError.parsingError("Could not find media edges")
         }
 
-        let pageInfo = media["page_info"] as? [String: Any]
-        let hasMore = pageInfo?["has_next_page"] as? Bool ?? false
-        let nextCursor = pageInfo?["end_cursor"] as? String
-
-        var discoveredMedia: [DiscoveredMedia] = []
-
-        for edge in edges {
-            guard let node = edge["node"] as? [String: Any] else { continue }
-            if let media = parseGraphQLNode(node) {
-                discoveredMedia.append(media)
-            }
-        }
-
-        return (discoveredMedia, nextCursor, hasMore)
+        return try parseTimelineConnection(media, username: username)
     }
 
     private func parseModernGraphQLResponse(_ connection: [String: Any], username: String) throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
-        let edges = connection["edges"] as? [[String: Any]] ?? []
+        return try parseTimelineConnection(connection, username: username)
+    }
+
+    private func parseTimelineConnection(
+        _ connection: [String: Any],
+        username: String
+    ) throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+        guard let edges = connection["edges"] as? [[String: Any]] else {
+            throw InstagramError.parsingError("Could not find media edges")
+        }
+
         let pageInfo = connection["page_info"] as? [String: Any]
         let hasMore = pageInfo?["has_next_page"] as? Bool ?? false
         let nextCursor = pageInfo?["end_cursor"] as? String
