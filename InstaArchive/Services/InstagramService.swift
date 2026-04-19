@@ -217,11 +217,9 @@ class InstagramService {
             config.httpCookieStorage = HTTPCookieStorage.shared
             config.httpShouldSetCookies = true
         } else {
-            config.httpCookieAcceptPolicy = .always
-            config.httpShouldSetCookies = true
-            if !ephemeral {
-                config.httpCookieStorage = nil
-            }
+            config.httpCookieAcceptPolicy = .never
+            config.httpCookieStorage = nil
+            config.httpShouldSetCookies = false
         }
         // NOTE: Do NOT set Accept-Encoding here. URLSession handles gzip/deflate
         // decompression automatically, but ONLY if you don't override Accept-Encoding.
@@ -655,7 +653,7 @@ class InstagramService {
 
     private func makePublicAPIRequest(url: URL, referer: String? = nil) -> URLRequest {
         var request = makeAPIRequest(url: url, referer: referer)
-        request.httpShouldHandleCookies = true
+        request.httpShouldHandleCookies = false
         request.setValue("0", forHTTPHeaderField: "X-IG-WWW-Claim")
         if (request.value(forHTTPHeaderField: "X-CSRFToken") ?? "").isEmpty {
             request.setValue("public", forHTTPHeaderField: "X-CSRFToken")
@@ -906,6 +904,27 @@ class InstagramService {
         }
 
         throw InstagramError.parsingError("Public profile metadata did not include media edges")
+    }
+
+    private func recoverFirstPageFromPublicProfileMetadata(
+        username: String,
+        after reason: String
+    ) async -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool)? {
+        do {
+            let recovered = try await fallbackToPublicProfileMetadata(username: username, cursor: nil)
+            guard !recovered.media.isEmpty else { return nil }
+            log.warn(
+                "Recovered \(recovered.media.count) latest posts for @\(username) via public profile metadata after \(reason). Stopping pagination because deeper public metadata paging is not available yet.",
+                context: "media"
+            )
+            return (recovered.media, nil, false)
+        } catch {
+            log.warn(
+                "First-page public metadata recovery failed for @\(username) after \(reason): \(error.localizedDescription)",
+                context: "media"
+            )
+            return nil
+        }
     }
 
     private func shortCursor(_ cursor: String?) -> String {
@@ -1233,20 +1252,41 @@ class InstagramService {
         var pagesWithAllKnown = 0
 
         while hasMore {
+            let pageNumber = (allMedia.count / 33) + 1
             let result: (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool)
             do {
                 log.info(
-                    "Requesting page \(allMedia.count / 33 + 1) for @\(username) (cursor=\(shortCursor(cursor)), strategy=\(workingStrategy ?? "auto"))",
+                    "Requesting page \(pageNumber) for @\(username) (cursor=\(shortCursor(cursor)), strategy=\(workingStrategy ?? "auto"))",
                     context: "media"
                 )
                 result = try await fetchRecentMedia(username: username, after: cursor)
             } catch {
-                log.warn("fetchRecentMedia failed on page \(allMedia.count / 33 + 1): \(error.localizedDescription)", context: "media")
-                break
+                if allMedia.isEmpty, cursor == nil,
+                   let recovered = await recoverFirstPageFromPublicProfileMetadata(
+                    username: username,
+                    after: "page 1 fetch failure (\(error.localizedDescription))"
+                   ) {
+                    result = recovered
+                } else {
+                    log.warn("fetchRecentMedia failed on page \(pageNumber): \(error.localizedDescription)", context: "media")
+                    break
+                }
             }
 
             if result.media.isEmpty {
-                log.info("Got empty page, stopping pagination", context: "media")
+                if allMedia.isEmpty, cursor == nil,
+                   let recovered = await recoverFirstPageFromPublicProfileMetadata(
+                    username: username,
+                    after: "empty page 1 response"
+                   ) {
+                    allMedia.append(contentsOf: recovered.media)
+                    log.info(
+                        "Page complete: \(recovered.media.count) items, total \(allMedia.count), hasMore: false",
+                        context: "media"
+                    )
+                } else {
+                    log.info("Got empty page, stopping pagination", context: "media")
+                }
                 break
             }
 
@@ -1846,8 +1886,28 @@ class InstagramService {
     }
 
     private func parseV1FeedResponse(from data: Data, username: String) throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let items = json["items"] as? [[String: Any]] else {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw InstagramError.parsingError("Could not parse v1 feed response")
+        }
+
+        if let status = json["status"] as? String, status == "fail" {
+            let message = json["message"] as? String ?? "Instagram rejected the feed request"
+            let requireLogin = json["require_login"] as? Bool ?? false
+            log.warn(
+                "v1 feed returned status=fail for @\(username): \(message) (require_login=\(requireLogin ? "yes" : "no"))",
+                context: "api"
+            )
+            throw InstagramError.parsingError(message)
+        }
+
+        guard let items = json["items"] as? [[String: Any]] else {
+            let topKeys = Array(json.keys).sorted().joined(separator: ", ")
+            let message = json["message"] as? String ?? ""
+            if !message.isEmpty {
+                log.warn("v1 feed missing items for @\(username): \(message)", context: "api")
+            } else {
+                log.warn("v1 feed missing items for @\(username); keys=[\(topKeys)]", context: "api")
+            }
             throw InstagramError.parsingError("Could not parse v1 feed response")
         }
 

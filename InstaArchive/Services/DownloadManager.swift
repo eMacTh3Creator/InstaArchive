@@ -283,6 +283,13 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
         return downloadedIds
     }
 
+    private func mediaTypeSummary(for media: [DiscoveredMedia]) -> String {
+        let counts = Dictionary(grouping: media, by: \.mediaType).mapValues(\.count)
+        return MediaType.allCases
+            .map { type in "\(type.rawValue)=\(counts[type, default: 0])" }
+            .joined(separator: ", ")
+    }
+
     // MARK: - Check single profile
 
     func checkProfile(_ profile: Profile, profileStore: ProfileStore) {
@@ -410,6 +417,12 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 )
                 allMedia.append(contentsOf: posts)
                 log.info("Found \(posts.count) posts for @\(username)", context: "check")
+                if posts.isEmpty, profileInfo.postCount > 0 {
+                    log.warn(
+                        "Post fetch returned 0 items for @\(username) even though profile metadata reports \(profileInfo.postCount) posts",
+                        context: "check"
+                    )
+                }
             } catch {
                 log.error("Failed to fetch posts for @\(username): \(error.localizedDescription)", context: "check")
                 throw error
@@ -447,6 +460,11 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 }
             }
 
+            log.info(
+                "@\(username): collected \(allMedia.count) media items before dedupe [\(mediaTypeSummary(for: allMedia))]",
+                context: "check"
+            )
+
             // Filter
             let newMedia = allMedia.filter { media in
                 if isDownloaded(media.instagramId) { return false }
@@ -458,6 +476,11 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 return true
             }
 
+            log.info(
+                "@\(username): dedupe kept \(newMedia.count)/\(allMedia.count) media items [\(mediaTypeSummary(for: newMedia))]",
+                context: "check"
+            )
+
             let filteredMedia = newMedia.filter { media in
                 switch media.mediaType {
                 case .post: return settings.downloadPosts
@@ -468,6 +491,11 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 case .profilePic: return true
                 }
             }
+
+            log.info(
+                "@\(username): settings kept \(filteredMedia.count)/\(newMedia.count) media items [\(mediaTypeSummary(for: filteredMedia))]",
+                context: "check"
+            )
 
             // Build flat job list
             struct DownloadJob {
@@ -526,6 +554,17 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                         preferredSavePath: preferredSavePath
                     ))
                 }
+            }
+
+            log.info(
+                "@\(username): built \(jobs.count) download jobs from \(filteredMedia.count) media items",
+                context: "download"
+            )
+            if jobs.isEmpty, filteredMedia.contains(where: { $0.mediaType != .profilePic }) {
+                log.warn(
+                    "No download jobs were built for @\(username) even though non-profile media survived filtering. Existing files or index entries likely marked them as already downloaded.",
+                    context: "download"
+                )
             }
 
             let totalToDownload = jobs.count
