@@ -60,6 +60,7 @@ class InstagramService {
     private let log = Logger.shared
 
     private var session: URLSession
+    private var publicSession: URLSession
     private let baseURL = "https://www.instagram.com"
     private let igAppId = "936619743392459"
 
@@ -191,18 +192,34 @@ class InstagramService {
     private let cdnUpgradeFailureThreshold = 3
 
     private init() {
+        let ignoreSystemProxies = AppSettings.shared.ignoreSystemProxyForInstagram
         self.session = URLSession(
+            configuration: Self.makeSessionConfiguration(ignoreSystemProxies: ignoreSystemProxies)
+        )
+        self.publicSession = URLSession(
             configuration: Self.makeSessionConfiguration(
-                ignoreSystemProxies: AppSettings.shared.ignoreSystemProxyForInstagram
+                ignoreSystemProxies: ignoreSystemProxies,
+                ephemeral: true,
+                usesSharedCookies: false
             )
         )
     }
 
-    private static func makeSessionConfiguration(ignoreSystemProxies: Bool, ephemeral: Bool = false) -> URLSessionConfiguration {
+    private static func makeSessionConfiguration(
+        ignoreSystemProxies: Bool,
+        ephemeral: Bool = false,
+        usesSharedCookies: Bool = true
+    ) -> URLSessionConfiguration {
         let config = ephemeral ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
-        config.httpCookieAcceptPolicy = .always
-        config.httpCookieStorage = HTTPCookieStorage.shared
-        config.httpShouldSetCookies = true
+        if usesSharedCookies {
+            config.httpCookieAcceptPolicy = .always
+            config.httpCookieStorage = HTTPCookieStorage.shared
+            config.httpShouldSetCookies = true
+        } else {
+            config.httpCookieAcceptPolicy = .never
+            config.httpCookieStorage = nil
+            config.httpShouldSetCookies = false
+        }
         // NOTE: Do NOT set Accept-Encoding here. URLSession handles gzip/deflate
         // decompression automatically, but ONLY if you don't override Accept-Encoding.
         // Setting it manually causes URLSession to return raw compressed bytes.
@@ -221,8 +238,17 @@ class InstagramService {
     func refreshNetworkConfiguration() {
         let ignoreSystemProxies = AppSettings.shared.ignoreSystemProxyForInstagram
         let oldSession = session
+        let oldPublicSession = publicSession
         session = URLSession(configuration: Self.makeSessionConfiguration(ignoreSystemProxies: ignoreSystemProxies))
+        publicSession = URLSession(
+            configuration: Self.makeSessionConfiguration(
+                ignoreSystemProxies: ignoreSystemProxies,
+                ephemeral: true,
+                usesSharedCookies: false
+            )
+        )
         oldSession.invalidateAndCancel()
+        oldPublicSession.invalidateAndCancel()
         resetSession()
         log.info("Updated Instagram networking mode (ignoreSystemProxies=\(ignoreSystemProxies ? "yes" : "no"))", context: "network")
     }
@@ -624,6 +650,16 @@ class InstagramService {
         return request
     }
 
+    private func makePublicAPIRequest(url: URL, referer: String? = nil) -> URLRequest {
+        var request = makeAPIRequest(url: url, referer: referer)
+        request.httpShouldHandleCookies = false
+        request.setValue("0", forHTTPHeaderField: "X-IG-WWW-Claim")
+        if (request.value(forHTTPHeaderField: "X-CSRFToken") ?? "").isEmpty {
+            request.setValue("public", forHTTPHeaderField: "X-CSRFToken")
+        }
+        return request
+    }
+
     /// Update the WWW claim from API response headers (Instagram rotates this).
     private func captureClaimFromResponse(_ response: URLResponse?) {
         guard let http = response as? HTTPURLResponse else { return }
@@ -646,7 +682,17 @@ class InstagramService {
 
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
 
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            log.warn("Authenticated profile info request failed for @\(username), trying public metadata fallback: \(error.localizedDescription)", context: "api")
+            if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "authenticated request error") {
+                return publicInfo
+            }
+            throw error
+        }
         captureClaimFromResponse(response)
 
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -655,12 +701,18 @@ class InstagramService {
 
         log.info("Profile info HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
 
-        // Detect HTML responses disguised as 200 OK
-        try validateAPIResponse(data: data, response: httpResponse, context: "fetchProfileInfo(@\(username))")
-
         switch httpResponse.statusCode {
         case 200:
-            break
+            do {
+                try validateAPIResponse(data: data, response: httpResponse, context: "fetchProfileInfo(@\(username))")
+                return try parseProfileInfo(from: data)
+            } catch {
+                log.warn("Authenticated profile info parse failed for @\(username), trying public metadata fallback", context: "api")
+                if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "authenticated parse failure") {
+                    return publicInfo
+                }
+                throw error
+            }
         case 404:
             log.error("Profile @\(username) not found (404)", context: "api")
             throw InstagramError.profileNotFound
@@ -673,11 +725,13 @@ class InstagramService {
             try await ensureSession()
             return try await fetchProfileInfoRetry(username: username)
         default:
-            log.warn("Unexpected HTTP \(httpResponse.statusCode) for @\(username), trying page scrape fallback", context: "api")
+            log.warn("Unexpected HTTP \(httpResponse.statusCode) for @\(username), trying public metadata fallback", context: "api")
+            if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "HTTP \(httpResponse.statusCode)") {
+                return publicInfo
+            }
+            log.warn("Public metadata fallback unavailable for @\(username), trying page scrape fallback", context: "api")
             return try await fetchProfileInfoFromPage(username: username)
         }
-
-        return try parseProfileInfo(from: data)
     }
 
     private func fetchProfileInfoRetry(username: String) async throws -> InstagramProfileInfo {
@@ -689,7 +743,17 @@ class InstagramService {
         }
 
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
-        let (data, response) = try await session.data(for: request)
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await session.data(for: request)
+        } catch {
+            log.warn("Profile info retry request failed for @\(username), trying public metadata fallback: \(error.localizedDescription)", context: "api")
+            if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "retry request error") {
+                return publicInfo
+            }
+            throw error
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
             throw InstagramError.networkError(URLError(.badServerResponse))
@@ -697,10 +761,17 @@ class InstagramService {
 
         log.info("Profile info retry HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
 
-        try validateAPIResponse(data: data, response: httpResponse, context: "fetchProfileInfoRetry(@\(username))")
-
         if httpResponse.statusCode == 200 {
-            return try parseProfileInfo(from: data)
+            do {
+                try validateAPIResponse(data: data, response: httpResponse, context: "fetchProfileInfoRetry(@\(username))")
+                return try parseProfileInfo(from: data)
+            } catch {
+                log.warn("Profile info retry parse failed for @\(username), trying public metadata fallback", context: "api")
+                if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "retry parse failure") {
+                    return publicInfo
+                }
+                throw error
+            }
         }
 
         if httpResponse.statusCode == 401 || httpResponse.statusCode == 403 {
@@ -708,7 +779,70 @@ class InstagramService {
             throw InstagramError.sessionError
         }
 
+        if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "retry HTTP \(httpResponse.statusCode)") {
+            return publicInfo
+        }
+
         return try await fetchProfileInfoFromPage(username: username)
+    }
+
+    private func fetchPublicProfileInfo(
+        username: String,
+        applyRateLimit: Bool = true
+    ) async throws -> InstagramProfileInfo {
+        if applyRateLimit {
+            await waitForRateLimit()
+        }
+
+        let urlString = "\(baseURL)/api/v1/users/web_profile_info/?username=\(username)"
+        guard let url = URL(string: urlString) else {
+            throw InstagramError.invalidURL
+        }
+
+        let request = makePublicAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
+        let (data, response) = try await publicSession.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw InstagramError.networkError(URLError(.badServerResponse))
+        }
+
+        log.info("Public profile info HTTP \(httpResponse.statusCode) for @\(username)", context: "api")
+
+        switch httpResponse.statusCode {
+        case 200:
+            try validateAPIResponse(data: data, response: httpResponse, context: "fetchPublicProfileInfo(@\(username))")
+            return try parseProfileInfo(from: data)
+        case 404:
+            throw InstagramError.profileNotFound
+        case 429:
+            throw InstagramError.rateLimited
+        default:
+            let preview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary data)"
+            log.warn(
+                "Public profile info returned HTTP \(httpResponse.statusCode) for @\(username). Preview: \(preview)",
+                context: "api"
+            )
+            throw InstagramError.parsingError("Public profile info request failed with HTTP \(httpResponse.statusCode)")
+        }
+    }
+
+    private func tryPublicProfileInfoFallback(
+        username: String,
+        after reason: String
+    ) async throws -> InstagramProfileInfo? {
+        do {
+            let info = try await fetchPublicProfileInfo(username: username, applyRateLimit: false)
+            if !info.userId.isEmpty {
+                log.info("Recovered profile metadata for @\(username) via clean public session after \(reason)", context: "api")
+                return info
+            }
+
+            log.warn("Public metadata fallback for @\(username) after \(reason) did not include a user ID", context: "api")
+            return nil
+        } catch {
+            log.warn("Public metadata fallback failed for @\(username) after \(reason): \(error.localizedDescription)", context: "api")
+            return nil
+        }
     }
 
     private func parseProfileInfo(from data: Data) throws -> InstagramProfileInfo {
@@ -1571,15 +1705,59 @@ class InstagramService {
         let request = makeAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
         paginationDepth += 1
 
-        let (data, response) = try await session.data(for: request)
-        captureClaimFromResponse(response)
+        do {
+            let (data, response) = try await session.data(for: request)
+            captureClaimFromResponse(response)
+
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
+                log.warn("Authenticated feed API returned status \(statusCode) for @\(username), trying public feed fallback", context: "api")
+                return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
+            }
+
+            do {
+                return try parseV1FeedResponse(from: data, username: username)
+            } catch {
+                log.warn("Authenticated feed parse failed for @\(username), trying public feed fallback", context: "api")
+                return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
+            }
+        } catch {
+            log.warn("Authenticated feed request failed for @\(username), trying public feed fallback: \(error.localizedDescription)", context: "api")
+            return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
+        }
+    }
+
+    private func fetchMediaViaPublicAPI(
+        username: String,
+        userId: String,
+        cursor: String?,
+        applyRateLimit: Bool = true
+    ) async throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+        if applyRateLimit {
+            await waitForRateLimit()
+        }
+
+        var urlComponents = URLComponents(string: "\(baseURL)/api/v1/feed/user/\(userId)/")!
+        var queryItems = [URLQueryItem(name: "count", value: "33")]
+        if let cursor = cursor {
+            queryItems.append(URLQueryItem(name: "max_id", value: cursor))
+        }
+        urlComponents.queryItems = queryItems
+
+        guard let url = urlComponents.url else {
+            throw InstagramError.invalidURL
+        }
+
+        let request = makePublicAPIRequest(url: url, referer: "https://www.instagram.com/\(username)/")
+        let (data, response) = try await publicSession.data(for: request)
 
         guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
-            log.warn("Feed API returned status \(statusCode) for @\(username)", context: "api")
+            log.warn("Public feed API returned status \(statusCode) for @\(username)", context: "api")
             throw InstagramError.networkError(URLError(.badServerResponse))
         }
 
+        log.info("Recovered posts for @\(username) via clean public session", context: "api")
         return try parseV1FeedResponse(from: data, username: username)
     }
 
