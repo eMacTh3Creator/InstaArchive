@@ -59,6 +59,12 @@ class InstagramService {
     static let shared = InstagramService()
     private let log = Logger.shared
 
+    private enum CookieMode {
+        case shared
+        case isolated
+        case disabled
+    }
+
     private var session: URLSession
     private var publicSession: URLSession
     private let baseURL = "https://www.instagram.com"
@@ -135,15 +141,13 @@ class InstagramService {
             return url
         }
 
+        if let displayURL = mediaObject["display_url"] as? String, !displayURL.isEmpty {
+            return displayURL
+        }
+
         if let resources = mediaObject["display_resources"] as? [[String: Any]],
            let url = bestResourceURL(from: resources) {
             log.info("bestImageURL: fell through to display_resources (\(resources.count) entries)", context: "resolution")
-            return url
-        }
-
-        if let resources = mediaObject["thumbnail_resources"] as? [[String: Any]],
-           let url = bestResourceURL(from: resources) {
-            log.warn("bestImageURL: fell through to thumbnail_resources — may be low-res", context: "resolution")
             return url
         }
 
@@ -153,8 +157,10 @@ class InstagramService {
             return url
         }
 
-        if let displayURL = mediaObject["display_url"] as? String, !displayURL.isEmpty {
-            return displayURL
+        if let resources = mediaObject["thumbnail_resources"] as? [[String: Any]],
+           let url = bestResourceURL(from: resources) {
+            log.warn("bestImageURL: fell through to thumbnail_resources — may be low-res", context: "resolution")
+            return url
         }
 
         if let thumbnailSrc = mediaObject["thumbnail_src"] as? String, !thumbnailSrc.isEmpty {
@@ -179,8 +185,10 @@ class InstagramService {
     private var csrfToken: String?
     private var igWWWClaim: String = "0"   // X-IG-WWW-Claim header (0 = logged out)
     private var sessionInitialized = false
+    private var publicSessionInitialized = false
     private var cachedUserIds: [String: String] = [:]
     private var cachedPublicProfilePages: [String: (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool)] = [:]
+    private var feedAuthBlockedUntil: [String: Date] = [:]
 
     /// Whether CDN URL upgrades (stripping size constraints from the `stp`
     /// query param) work for this session. Three states:
@@ -197,13 +205,16 @@ class InstagramService {
     private init() {
         let ignoreSystemProxies = AppSettings.shared.ignoreSystemProxyForInstagram
         self.session = URLSession(
-            configuration: Self.makeSessionConfiguration(ignoreSystemProxies: ignoreSystemProxies)
+            configuration: Self.makeSessionConfiguration(
+                ignoreSystemProxies: ignoreSystemProxies,
+                cookieMode: .shared
+            )
         )
         self.publicSession = URLSession(
             configuration: Self.makeSessionConfiguration(
                 ignoreSystemProxies: ignoreSystemProxies,
                 ephemeral: true,
-                usesSharedCookies: false
+                cookieMode: .isolated
             )
         )
     }
@@ -211,14 +222,21 @@ class InstagramService {
     private static func makeSessionConfiguration(
         ignoreSystemProxies: Bool,
         ephemeral: Bool = false,
-        usesSharedCookies: Bool = true
+        cookieMode: CookieMode = .shared
     ) -> URLSessionConfiguration {
         let config = ephemeral ? URLSessionConfiguration.ephemeral : URLSessionConfiguration.default
-        if usesSharedCookies {
+        switch cookieMode {
+        case .shared:
             config.httpCookieAcceptPolicy = .always
             config.httpCookieStorage = HTTPCookieStorage.shared
             config.httpShouldSetCookies = true
-        } else {
+        case .isolated:
+            config.httpCookieAcceptPolicy = .always
+            // Keep the session cookie jar isolated from the authenticated
+            // browser cookies, but still allow Instagram to set device-ish
+            // public cookies across multiple requests in the same session.
+            config.httpShouldSetCookies = true
+        case .disabled:
             config.httpCookieAcceptPolicy = .never
             config.httpCookieStorage = nil
             config.httpShouldSetCookies = false
@@ -247,12 +265,13 @@ class InstagramService {
             configuration: Self.makeSessionConfiguration(
                 ignoreSystemProxies: ignoreSystemProxies,
                 ephemeral: true,
-                usesSharedCookies: false
+                cookieMode: .isolated
             )
         )
         oldSession.invalidateAndCancel()
         oldPublicSession.invalidateAndCancel()
         resetSession()
+        publicSessionInitialized = false
         log.info("Updated Instagram networking mode (ignoreSystemProxies=\(ignoreSystemProxies ? "yes" : "no"))", context: "network")
     }
 
@@ -513,8 +532,87 @@ class InstagramService {
         igWWWClaim = "0"
     }
 
+    private func ensurePublicSession(applyRateLimit: Bool = true) async {
+        let hasCookies = !(publicSession.configuration.httpCookieStorage?.cookies?.isEmpty ?? true)
+        if publicSessionInitialized && hasCookies && publicCSRFToken() != "public" {
+            return
+        }
+
+        if applyRateLimit {
+            await waitForRateLimit()
+        }
+
+        guard let url = URL(string: baseURL + "/") else { return }
+
+        var request = URLRequest(url: url)
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7", forHTTPHeaderField: "Accept")
+        request.setValue("document", forHTTPHeaderField: "Sec-Fetch-Dest")
+        request.setValue("navigate", forHTTPHeaderField: "Sec-Fetch-Mode")
+        request.setValue("none", forHTTPHeaderField: "Sec-Fetch-Site")
+        request.setValue("?1", forHTTPHeaderField: "Sec-Fetch-User")
+        request.setValue("1", forHTTPHeaderField: "Upgrade-Insecure-Requests")
+
+        do {
+            let (_, response) = try await publicSession.data(for: request)
+            publicSessionInitialized = true
+            let cookieCount = publicSession.configuration.httpCookieStorage?.cookies?.count ?? 0
+            if let httpResponse = response as? HTTPURLResponse {
+                log.info(
+                    "Prepared isolated public Instagram session (HTTP \(httpResponse.statusCode), cookies=\(cookieCount), csrf=\(publicCSRFToken() != "public" ? "yes" : "no"))",
+                    context: "session"
+                )
+            } else {
+                log.info(
+                    "Prepared isolated public Instagram session (cookies=\(cookieCount), csrf=\(publicCSRFToken() != "public" ? "yes" : "no"))",
+                    context: "session"
+                )
+            }
+        } catch {
+            log.warn("Failed to prepare isolated public Instagram session: \(error.localizedDescription)", context: "session")
+        }
+    }
+
     private func shouldRetryAuthenticatedRequest(statusCode: Int) -> Bool {
         [400, 401, 403].contains(statusCode)
+    }
+
+    private func publicCSRFToken() -> String {
+        if let cookies = publicSession.configuration.httpCookieStorage?.cookies {
+            for cookie in cookies where cookie.domain.contains("instagram") {
+                if cookie.name == "csrftoken", !cookie.value.isEmpty {
+                    return cookie.value
+                }
+            }
+        }
+        return "public"
+    }
+
+    private func isCheckpointResponse(_ data: Data) -> Bool {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return false
+        }
+        let message = (json["message"] as? String ?? "").lowercased()
+        let checkpointURL = json["checkpoint_url"] as? String ?? ""
+        let locked = json["lock"] as? Bool ?? false
+        return message == "checkpoint_required" || !checkpointURL.isEmpty || locked
+    }
+
+    private func isAuthFeedTemporarilyBlocked(for username: String) -> Bool {
+        guard let until = feedAuthBlockedUntil[username] else { return false }
+        if until > Date() {
+            return true
+        }
+        feedAuthBlockedUntil.removeValue(forKey: username)
+        return false
+    }
+
+    private func markAuthFeedBlocked(for username: String, reason: String) {
+        let until = Date().addingTimeInterval(30 * 60)
+        feedAuthBlockedUntil[username] = until
+        log.warn(
+            "Skipping authenticated feed requests for @\(username) until \(until.formatted(date: .omitted, time: .shortened)) after \(reason)",
+            context: "api"
+        )
     }
 
     /// Refresh the browser-like session context that Instagram expects for web API calls.
@@ -735,11 +833,8 @@ class InstagramService {
 
     private func makePublicAPIRequest(url: URL, referer: String? = nil) -> URLRequest {
         var request = makeAPIRequest(url: url, referer: referer)
-        request.httpShouldHandleCookies = false
         request.setValue("0", forHTTPHeaderField: "X-IG-WWW-Claim")
-        if (request.value(forHTTPHeaderField: "X-CSRFToken") ?? "").isEmpty {
-            request.setValue("public", forHTTPHeaderField: "X-CSRFToken")
-        }
+        request.setValue(publicCSRFToken(), forHTTPHeaderField: "X-CSRFToken")
         return request
     }
 
@@ -873,6 +968,7 @@ class InstagramService {
         username: String,
         applyRateLimit: Bool = true
     ) async throws -> InstagramProfileInfo {
+        await ensurePublicSession(applyRateLimit: applyRateLimit)
         if applyRateLimit {
             await waitForRateLimit()
         }
@@ -1947,6 +2043,11 @@ class InstagramService {
 
         let userId = try await getUserId(for: username)
 
+        if isAuthFeedTemporarilyBlocked(for: username) {
+            log.info("Authenticated feed is temporarily blocked for @\(username); using isolated public feed session", context: "api")
+            return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
+        }
+
         var urlComponents = URLComponents(string: "\(baseURL)/api/v1/feed/user/\(userId)/")!
         var queryItems = [URLQueryItem(name: "count", value: "33")]
         if let cursor = cursor {
@@ -1977,6 +2078,10 @@ class InstagramService {
             guard httpResponse.statusCode == 200 else {
                 let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
                 let preview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary data)"
+                if isCheckpointResponse(data) {
+                    markAuthFeedBlocked(for: username, reason: "checkpoint_required")
+                    return try await fetchMediaViaPublicAPI(username: username, userId: userId, cursor: cursor, applyRateLimit: false)
+                }
                 if allowRecovery && shouldRetryAuthenticatedRequest(statusCode: statusCode) {
                     log.warn("Authenticated feed API returned status \(statusCode) for @\(username), refreshing session context and retrying once. Preview: \(preview)", context: "api")
                     await refreshSessionContext(after: "feed HTTP \(statusCode) for @\(username)")
@@ -2014,8 +2119,10 @@ class InstagramService {
         username: String,
         userId: String,
         cursor: String?,
-        applyRateLimit: Bool = true
+        applyRateLimit: Bool = true,
+        allowRecovery: Bool = true
     ) async throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+        await ensurePublicSession(applyRateLimit: applyRateLimit)
         if applyRateLimit {
             await waitForRateLimit()
         }
@@ -2042,12 +2149,28 @@ class InstagramService {
         guard httpResponse.statusCode == 200 else {
             let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 0
             let preview = String(data: data.prefix(200), encoding: .utf8) ?? "(binary data)"
+            if allowRecovery && [401, 403].contains(statusCode) {
+                log.warn(
+                    "Public feed API returned status \(statusCode) for @\(username), refreshing isolated public session and retrying once. Preview: \(preview)",
+                    context: "api"
+                )
+                publicSessionInitialized = false
+                await ensurePublicSession(applyRateLimit: false)
+                return try await fetchMediaViaPublicAPI(
+                    username: username,
+                    userId: userId,
+                    cursor: cursor,
+                    applyRateLimit: false,
+                    allowRecovery: false
+                )
+            }
             log.warn("Public feed API returned status \(statusCode) for @\(username). Preview: \(preview)", context: "api")
             return try await fallbackToPublicProfileMetadata(username: username, cursor: cursor)
         }
 
         do {
-            log.info("Recovered posts for @\(username) via isolated public feed session", context: "api")
+            let cookieCount = publicSession.configuration.httpCookieStorage?.cookies?.count ?? 0
+            log.info("Recovered posts for @\(username) via isolated public feed session (cookies=\(cookieCount))", context: "api")
             return try parseV1FeedResponse(from: data, username: username)
         } catch {
             log.warn("Public feed parse failed for @\(username): \(error.localizedDescription). Trying public profile metadata fallback", context: "api")
@@ -2621,13 +2744,15 @@ class InstagramService {
     }
 
     private func extractBestImageURLFromHTML(_ html: String) -> String? {
-        extractBestImageURL(from: html, arrayKeys: ["image_versions2", "display_resources", "thumbnail_resources"])
+        extractBestImageURL(from: html, arrayKeys: ["image_versions2", "display_resources"])
             ?? extractURLFromHTML(html, key: "display_url")
+            ?? extractBestImageURL(from: html, arrayKeys: ["thumbnail_resources"])
     }
 
     private func extractBestImageURLFromContext(_ context: String) -> String? {
-        extractBestImageURL(from: context, arrayKeys: ["image_versions2", "display_resources", "thumbnail_resources"])
+        extractBestImageURL(from: context, arrayKeys: ["image_versions2", "display_resources"])
             ?? extractURLFromContext(context, key: "display_url")
+            ?? extractBestImageURL(from: context, arrayKeys: ["thumbnail_resources"])
     }
 
     private func extractBestImageURL(from text: String, arrayKeys: [String]) -> String? {

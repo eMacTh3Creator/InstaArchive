@@ -86,6 +86,13 @@ class SchedulerService: ObservableObject {
         // scheduler does not blast a large number of profiles in parallel.
         downloadManager.checkProfiles(profiles, profileStore: profileStore)
 
+        // The batch starts on a detached task, so give it a brief window to
+        // flip into the running state before we begin polling for completion.
+        let startDeadline = Date().addingTimeInterval(5)
+        while !downloadManager.isRunning && Date() < startDeadline {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+
         // Wait for downloads to finish (polling every 2s)
         while downloadManager.isRunning {
             try? await Task.sleep(nanoseconds: 2_000_000_000)

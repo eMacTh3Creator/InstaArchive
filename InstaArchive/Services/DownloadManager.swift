@@ -662,6 +662,13 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
                 warnings.append("\(failedCount) file\(failedCount == 1 ? "" : "s") failed to download")
             }
 
+            if finalNewItemCount > 0 {
+                log.info(
+                    "@\(username): saved downloads under \(settings.profileDirectory(for: username).path)",
+                    context: "download"
+                )
+            }
+
             log.info("@\(username) complete: \(finalNewItemCount) new, \(failedCount) failed", context: "check")
 
             await MainActor.run {
