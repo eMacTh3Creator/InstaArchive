@@ -7,6 +7,7 @@ struct ContentView: View {
     @State private var selectedProfile: Profile?
     @State private var selectedProfileIds: Set<UUID> = []
     @State private var showingAddProfile = false
+    @State private var showingImportProfiles = false
     @State private var showingSettings = false
     @State private var showingInstagramLogin = false
     @State private var showingDeleteConfirmation = false
@@ -78,6 +79,9 @@ struct ContentView: View {
                 }
             }
         }
+        .sheet(isPresented: $showingImportProfiles) {
+            ImportProfilesView()
+        }
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Button(action: {
@@ -119,6 +123,7 @@ struct ContentView: View {
         }
         .focusedSceneValue(\.selectedProfile, $selectedProfile)
         .focusedSceneValue(\.showingAddProfile, $showingAddProfile)
+        .focusedSceneValue(\.showingImportProfiles, $showingImportProfiles)
         .focusedSceneValue(\.showingSettings, $showingSettings)
         .focusedSceneValue(\.checkAllAction, checkAll)
         .onReceive(NotificationCenter.default.publisher(for: .webServerOpenInstagramLogin)) { _ in

@@ -10,6 +10,9 @@ extension FocusedValues {
     struct ShowingAddProfileKey: FocusedValueKey {
         typealias Value = Binding<Bool>
     }
+    struct ShowingImportProfilesKey: FocusedValueKey {
+        typealias Value = Binding<Bool>
+    }
     struct ShowingSettingsKey: FocusedValueKey {
         typealias Value = Binding<Bool>
     }
@@ -24,6 +27,10 @@ extension FocusedValues {
     var showingAddProfile: Binding<Bool>? {
         get { self[ShowingAddProfileKey.self] }
         set { self[ShowingAddProfileKey.self] = newValue }
+    }
+    var showingImportProfiles: Binding<Bool>? {
+        get { self[ShowingImportProfilesKey.self] }
+        set { self[ShowingImportProfilesKey.self] = newValue }
     }
     var showingSettings: Binding<Bool>? {
         get { self[ShowingSettingsKey.self] }
@@ -47,6 +54,7 @@ struct InstaArchiveApp: App {
 
     @FocusedBinding(\.selectedProfile) var selectedProfile
     @FocusedBinding(\.showingAddProfile) var showingAddProfile
+    @FocusedBinding(\.showingImportProfiles) var showingImportProfiles
     @FocusedBinding(\.showingSettings) var showingSettings
     @FocusedValue(\.checkAllAction) var checkAllAction
 
@@ -103,7 +111,7 @@ struct InstaArchiveApp: App {
                 .keyboardShortcut("e", modifiers: [.command, .shift])
 
                 Button("Import Profiles...") {
-                    importProfiles()
+                    showingImportProfiles = true
                 }
                 .keyboardShortcut("i", modifiers: [.command, .shift])
             }
@@ -151,35 +159,6 @@ extension InstaArchiveApp {
         } catch {
             let alert = NSAlert()
             alert.messageText = "Export Failed"
-            alert.informativeText = error.localizedDescription
-            alert.alertStyle = .warning
-            alert.runModal()
-        }
-    }
-
-    func importProfiles() {
-        let panel = NSOpenPanel()
-        panel.title = "Import Profiles"
-        panel.message = "Choose an InstaArchive export file. The app will validate that it contains profile JSON."
-        panel.allowsMultipleSelection = false
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.resolvesAliases = true
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        do {
-            let added = try profileStore.importProfiles(from: url)
-            let alert = NSAlert()
-            alert.messageText = "Import Complete"
-            alert.informativeText = added > 0
-                ? "Added \(added) new profile\(added == 1 ? "" : "s")."
-                : "No new profiles to import (all already exist)."
-            alert.alertStyle = .informational
-            alert.runModal()
-        } catch {
-            let alert = NSAlert()
-            alert.messageText = "Import Failed"
             alert.informativeText = error.localizedDescription
             alert.alertStyle = .warning
             alert.runModal()

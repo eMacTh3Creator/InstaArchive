@@ -31,6 +31,7 @@
 		AA000022 /* Logger.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000024 /* Logger.swift */; };
 		AA000023 /* UpdateChecker.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000025 /* UpdateChecker.swift */; };
 		AA000024 /* NetworkDiagnosticsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000026 /* NetworkDiagnosticsService.swift */; };
+		AA000025 /* ImportProfilesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB000027 /* ImportProfilesView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -60,6 +61,7 @@
 		AB000024 /* Logger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Logger.swift; sourceTree = "<group>"; };
 		AB000025 /* UpdateChecker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateChecker.swift; sourceTree = "<group>"; };
 		AB000026 /* NetworkDiagnosticsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NetworkDiagnosticsService.swift; sourceTree = "<group>"; };
+		AB000027 /* ImportProfilesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportProfilesView.swift; sourceTree = "<group>"; };
 		AC000001 /* InstaArchive.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = InstaArchive.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -119,6 +121,7 @@
 				AB000007 /* MenuBarView.swift */,
 				AB000008 /* OnboardingView.swift */,
 				AB000021 /* InstagramLoginView.swift */,
+				AB000027 /* ImportProfilesView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -241,12 +244,13 @@
 				AA000015 /* StorageManager.swift in Sources */,
 				AA000016 /* SchedulerService.swift in Sources */,
 				AA000017 /* LaunchAtLogin.swift in Sources */,
-			AA000019 /* InstagramLoginView.swift in Sources */,
-			AA000020 /* ThumbnailCache.swift in Sources */,
-			AA000021 /* WebServer.swift in Sources */,
-			AA000022 /* Logger.swift in Sources */,
-			AA000023 /* UpdateChecker.swift in Sources */,
-			AA000024 /* NetworkDiagnosticsService.swift in Sources */,
+				AA000019 /* InstagramLoginView.swift in Sources */,
+				AA000020 /* ThumbnailCache.swift in Sources */,
+				AA000021 /* WebServer.swift in Sources */,
+				AA000022 /* Logger.swift in Sources */,
+				AA000023 /* UpdateChecker.swift in Sources */,
+				AA000024 /* NetworkDiagnosticsService.swift in Sources */,
+				AA000025 /* ImportProfilesView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
