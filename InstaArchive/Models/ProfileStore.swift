@@ -96,9 +96,7 @@ class ProfileStore: ObservableObject {
     @discardableResult
     func importProfiles(from url: URL) throws -> Int {
         let data = try Data(contentsOf: url)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let imported = try decoder.decode([Profile].self, from: data)
+        let imported = try decodeImportedProfiles(from: data)
 
         var added = 0
         for var profile in imported {
@@ -127,5 +125,32 @@ class ProfileStore: ObservableObject {
             saveAllAsync()
         }
         return added
+    }
+
+    private func decodeImportedProfiles(from data: Data) throws -> [Profile] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+
+        if let directProfiles = try? decoder.decode([Profile].self, from: data) {
+            return directProfiles
+        }
+
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let rawProfiles = object["profiles"],
+           JSONSerialization.isValidJSONObject(rawProfiles) {
+            let wrappedData = try JSONSerialization.data(withJSONObject: rawProfiles, options: [])
+            if let wrappedProfiles = try? decoder.decode([Profile].self, from: wrappedData) {
+                return wrappedProfiles
+            }
+        }
+
+        throw NSError(
+            domain: "InstaArchive.ProfileImport",
+            code: 1,
+            userInfo: [
+                NSLocalizedDescriptionKey: "This file is not a valid InstaArchive profile export.",
+                NSLocalizedRecoverySuggestionErrorKey: "Use a JSON export created by InstaArchive. If the file came from another source, open it and confirm it contains a JSON list of profiles."
+            ]
+        )
     }
 }

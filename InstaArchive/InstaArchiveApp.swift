@@ -160,9 +160,13 @@ extension InstaArchiveApp {
     func importProfiles() {
         let panel = NSOpenPanel()
         panel.title = "Import Profiles"
-        panel.allowedContentTypes = [.json]
+        panel.message = "Choose a profiles export file in JSON format."
+        panel.allowedContentTypes = [.json, .plainText]
+        panel.allowsOtherFileTypes = true
         panel.allowsMultipleSelection = false
+        panel.canChooseFiles = true
         panel.canChooseDirectories = false
+        panel.resolvesAliases = true
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
 
