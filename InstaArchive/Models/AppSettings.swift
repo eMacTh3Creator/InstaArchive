@@ -25,6 +25,15 @@ class AppSettings: ObservableObject {
         static let webServerEnabled = "webServerEnabled"
         static let webServerPassword = "webServerPassword"
         static let ignoreSystemProxyForInstagram = "ignoreSystemProxyForInstagram"
+        // Advanced (Diagnostics) toggles — each re-activates a defensive layer
+        // that was added in v1.5–v1.6 in response to Instagram's anti-bot
+        // system. All default to `false` so v1.7+ behaves like the simpler
+        // v1.3-era downloader; flip these on one at a time if you need the
+        // corresponding protection back.
+        static let enableCDNUpgrade = "enableCDNUpgrade"
+        static let enableJPEGValidation = "enableJPEGValidation"
+        static let enablePublicMetadataFallback = "enablePublicMetadataFallback"
+        static let useStrictRateLimit = "useStrictRateLimit"
     }
 
     @Published var downloadPath: String {
@@ -99,6 +108,43 @@ class AppSettings: ObservableObject {
         didSet { defaults.set(ignoreSystemProxyForInstagram, forKey: Keys.ignoreSystemProxyForInstagram) }
     }
 
+    // MARK: - Advanced (Diagnostics)
+
+    /// When ON, the downloader rewrites signed CDN URLs (stripping `stp=..._p480x480`
+    /// size directives) to try to get full-resolution images. This breaks the
+    /// CDN signature on many paths and is the root cause of v1.5.10-v1.6.11
+    /// retry storms. Default OFF — save whatever URL Instagram gave us.
+    @Published var enableCDNUpgrade: Bool {
+        didSet { defaults.set(enableCDNUpgrade, forKey: Keys.enableCDNUpgrade) }
+    }
+
+    /// When ON, the downloader validates image responses against the JPEG
+    /// magic bytes (`FF D8 FF`) and rejects anything else. v1.5.13 added
+    /// this to catch WebP/AVIF responses being saved with `.jpg` extension,
+    /// but it causes hard download failures on modern Instagram CDN nodes
+    /// that serve WebP by default. Default OFF — save the bytes, log a warning.
+    @Published var enableJPEGValidation: Bool {
+        didSet { defaults.set(enableJPEGValidation, forKey: Keys.enableJPEGValidation) }
+    }
+
+    /// When ON, use the cached public profile metadata (first 12 posts) as a
+    /// fallback when the authenticated and public feed APIs both fail.
+    /// v1.6.6+ added this for blocked sessions — but it silently truncates
+    /// archives to 12 items when triggered mid-pagination. Default OFF so
+    /// failures are visible instead of hidden.
+    @Published var enablePublicMetadataFallback: Bool {
+        didSet { defaults.set(enablePublicMetadataFallback, forKey: Keys.enablePublicMetadataFallback) }
+    }
+
+    /// When ON, use the v1.4 anti-bot rate limits: 5 s base interval + up to
+    /// 45 s jitter + depth multiplier + hard 100 req/hour cap. When OFF
+    /// (default), a lighter limiter is used: 3 s base + 0–5 s jitter, 500
+    /// req/hour cap, no depth multiplier. Flip on only if Instagram starts
+    /// rate-limiting you in the relaxed mode.
+    @Published var useStrictRateLimit: Bool {
+        didSet { defaults.set(useStrictRateLimit, forKey: Keys.useStrictRateLimit) }
+    }
+
     private init() {
         let defaultDownloadPath = FileManager.default.urls(for: .picturesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("InstaArchive").path ?? "~/Pictures/InstaArchive"
@@ -120,6 +166,10 @@ class AppSettings: ObservableObject {
         self.webServerEnabled = defaults.object(forKey: Keys.webServerEnabled) as? Bool ?? true
         self.webServerPassword = defaults.string(forKey: Keys.webServerPassword) ?? ""
         self.ignoreSystemProxyForInstagram = defaults.object(forKey: Keys.ignoreSystemProxyForInstagram) as? Bool ?? false
+        self.enableCDNUpgrade = defaults.object(forKey: Keys.enableCDNUpgrade) as? Bool ?? false
+        self.enableJPEGValidation = defaults.object(forKey: Keys.enableJPEGValidation) as? Bool ?? false
+        self.enablePublicMetadataFallback = defaults.object(forKey: Keys.enablePublicMetadataFallback) as? Bool ?? false
+        self.useStrictRateLimit = defaults.object(forKey: Keys.useStrictRateLimit) as? Bool ?? false
     }
 
     /// Returns the full path for a given profile's download directory

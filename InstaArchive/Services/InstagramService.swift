@@ -135,6 +135,13 @@ class InstagramService {
     /// Resolve the best image URL from a mixed Instagram media object.
     /// This prefers full image candidates and only falls back to preview fields
     /// like `display_url` when no richer source is available.
+    ///
+    /// As of v1.7.0 the `thumbnail_resources` and `thumbnail_src` fallbacks
+    /// have been removed: saving a 150 px thumbnail with the correct-looking
+    /// filename made users think the archive was complete when it was not.
+    /// If no full-size candidate is available, the caller gets `nil` and
+    /// skips the item (visibly, in the logs and status) instead of quietly
+    /// saving a thumbnail.
     private func bestImageURL(from mediaObject: [String: Any]) -> String? {
         if let candidates = (mediaObject["image_versions2"] as? [String: Any])?["candidates"] as? [[String: Any]],
            let url = bestImageURL(from: candidates) {
@@ -157,25 +164,30 @@ class InstagramService {
             return url
         }
 
-        if let resources = mediaObject["thumbnail_resources"] as? [[String: Any]],
-           let url = bestResourceURL(from: resources) {
-            log.warn("bestImageURL: fell through to thumbnail_resources — may be low-res", context: "resolution")
-            return url
+        // Intentional: do NOT fall through to thumbnail_resources / thumbnail_src.
+        // Those served 150 px thumbnails disguised as full posts.
+        if mediaObject["thumbnail_resources"] != nil || mediaObject["thumbnail_src"] != nil {
+            log.warn("bestImageURL: only thumbnail-tier fields available — skipping item so it stays queued for retry", context: "resolution")
         }
-
-        if let thumbnailSrc = mediaObject["thumbnail_src"] as? String, !thumbnailSrc.isEmpty {
-            log.warn("bestImageURL: fell through to thumbnail_src — this IS a thumbnail", context: "resolution")
-            return thumbnailSrc
-        }
-
         return nil
     }
 
     // Rate limiting — thread-safe with lock
     private var lastRequestTime: Date?
     private let rateLock = NSLock()
-    private let minimumRequestInterval: TimeInterval = 5.0
-    private let hourlyRequestBudget = 100
+    /// Base delay between API requests. Strict mode (5 s) was the v1.4–v1.6.11
+    /// anti-bot default but caused hour-long sleeps when the hourly budget was
+    /// exhausted. Relaxed mode (3 s) is the v1.7+ default and restores v1.3-era
+    /// throughput while still leaving a polite gap between requests.
+    private var minimumRequestInterval: TimeInterval {
+        AppSettings.shared.useStrictRateLimit ? 5.0 : 3.0
+    }
+    /// Ceiling on API requests per hour. Strict mode (100) is Instagram-polite
+    /// but causes a session that walks a 500-post profile to stall for hours.
+    /// Relaxed mode (500) matches what the old downloader was doing implicitly.
+    private var hourlyRequestBudget: Int {
+        AppSettings.shared.useStrictRateLimit ? 100 : 500
+    }
     private var requestCount: Int = 0
     private var hourWindowStart: Date = Date()
     private var nextAllowedRequestTime: Date = Date()
@@ -716,25 +728,34 @@ class InstagramService {
         return (max(0, scheduledTime.timeIntervalSince(now)), requestCount, rolloverDelay)
     }
 
-    /// Thread-safe rate limiter with human-like jitter and hourly budget.
-    /// Instagram's detection looks for: consistent intervals, high volume bursts,
-    /// and sustained request rates that no human would produce.
+    /// Thread-safe rate limiter. In strict mode (v1.4 behavior), adds
+    /// human-like jitter and depth scaling. In relaxed mode (v1.7+ default),
+    /// uses light jitter only — the depth multiplier and long-tail pauses
+    /// stack too much delay and were causing session timeouts.
     private func waitForRateLimit() async {
-        // Human-like jitter: mix of short and occasional longer pauses
-        let roll = Double.random(in: 0...1)
+        let strict = AppSettings.shared.useStrictRateLimit
+
         let jitter: Double
-        if roll < 0.55 {
-            jitter = Double.random(in: 2.0...5.0)     // 55%: normal browsing pace
-        } else if roll < 0.82 {
-            jitter = Double.random(in: 5.0...12.0)    // 27%: slower / reading pause
-        } else if roll < 0.95 {
-            jitter = Double.random(in: 12.0...25.0)   // 13%: long pause (distracted)
+        if strict {
+            // Original v1.4 distribution — mix of short and occasional long pauses.
+            let roll = Double.random(in: 0...1)
+            if roll < 0.55 {
+                jitter = Double.random(in: 2.0...5.0)     // 55%: normal browsing pace
+            } else if roll < 0.82 {
+                jitter = Double.random(in: 5.0...12.0)    // 27%: slower / reading pause
+            } else if roll < 0.95 {
+                jitter = Double.random(in: 12.0...25.0)   // 13%: long pause
+            } else {
+                jitter = Double.random(in: 25.0...45.0)   //  5%: very long pause
+            }
         } else {
-            jitter = Double.random(in: 25.0...45.0)   //  5%: very long pause (tab-switched)
+            // Relaxed: small random jitter only.
+            jitter = Double.random(in: 0.0...5.0)
         }
 
-        // Deeper into pagination → longer delays (mimics scroll fatigue)
-        let depthMultiplier = 1.0 + Double(min(paginationDepth, 10)) * 0.1
+        // Depth scaling only applies in strict mode — in relaxed mode the
+        // base interval + small jitter is enough spacing.
+        let depthMultiplier = strict ? (1.0 + Double(min(paginationDepth, 10)) * 0.1) : 1.0
         let effectiveInterval = (minimumRequestInterval + jitter) * depthMultiplier
 
         let reservation = reserveRequestSlot(effectiveInterval: effectiveInterval)
@@ -1061,6 +1082,16 @@ class InstagramService {
         username: String,
         cursor: String?
     ) async throws -> (media: [DiscoveredMedia], nextCursor: String?, hasMore: Bool) {
+        // Opt-in since v1.7.0 (Settings → Advanced). This fallback returns
+        // only the first ~12 posts cached from the profile page metadata,
+        // and has no cursor pagination. When it triggers mid-walk (e.g. on
+        // page 3 of 10), pages 3–10 are silently dropped. Default OFF so
+        // fetch failures are visible instead of hidden behind a truncated
+        // archive that looks "complete."
+        guard AppSettings.shared.enablePublicMetadataFallback else {
+            throw InstagramError.parsingError("Public metadata fallback disabled (enable in Settings → Advanced to re-activate)")
+        }
+
         if let cursor, !cursor.isEmpty {
             log.warn(
                 "Public profile metadata fallback has no cursor pagination support for @\(username) (cursor=\(shortCursor(cursor))); stopping with items collected so far",
@@ -2940,36 +2971,40 @@ class InstagramService {
         // No rate limiting for CDN downloads — these are pre-signed URLs
         // that don't count against Instagram's API rate limit.
 
-        // Try CDN URL upgrade for full resolution, unless the latch says it's broken.
-        if cdnUpgradeState != .broken {
-            let upgraded = upgradeImageURL(urlString)
-            if upgraded != urlString {
-                do {
-                    let data = try await performCDNDownload(from: upgraded)
-                    if cdnUpgradeState != .works {
-                        cdnUpgradeState = .works
-                        cdnUpgradeFailureCount = 0
-                        log.info("CDN URL upgrade works — downloading original-resolution images", context: "resolution")
-                    }
-                    return data
-                } catch {
-                    // Only latch to `.broken` after repeated failures — a single
-                    // transient network error shouldn't permanently disable
-                    // upgrades for the whole session. Once we've seen `.works`
-                    // at least once, we never latch off.
-                    if cdnUpgradeState == .untested {
-                        cdnUpgradeFailureCount += 1
-                        if cdnUpgradeFailureCount >= cdnUpgradeFailureThreshold {
-                            cdnUpgradeState = .broken
-                            log.warn("CDN URL upgrade rejected \(cdnUpgradeFailureCount)× — using API-provided URLs as-is", context: "resolution")
-                        }
-                    }
-                    // Fall through to original URL
-                }
-            }
+        // CDN URL upgrade is opt-in (Settings → Advanced) since v1.7.0.
+        // The upgrade rewrites signed CDN URLs, which breaks the signature
+        // on many paths (→ 403), wastes 2× the requests per image, and
+        // rarely produces higher-resolution content than what the API
+        // already returned. Default off: download the URL as Instagram
+        // provided it.
+        guard AppSettings.shared.enableCDNUpgrade, cdnUpgradeState != .broken else {
+            return try await performCDNDownload(from: urlString)
         }
 
-        return try await performCDNDownload(from: urlString)
+        let upgraded = upgradeImageURL(urlString)
+        guard upgraded != urlString else {
+            return try await performCDNDownload(from: urlString)
+        }
+
+        do {
+            let data = try await performCDNDownload(from: upgraded)
+            if cdnUpgradeState != .works {
+                cdnUpgradeState = .works
+                cdnUpgradeFailureCount = 0
+                log.info("CDN URL upgrade works — downloading original-resolution images", context: "resolution")
+            }
+            return data
+        } catch {
+            if cdnUpgradeState == .untested {
+                cdnUpgradeFailureCount += 1
+                if cdnUpgradeFailureCount >= cdnUpgradeFailureThreshold {
+                    cdnUpgradeState = .broken
+                    log.warn("CDN URL upgrade rejected \(cdnUpgradeFailureCount)× — using API-provided URLs as-is", context: "resolution")
+                }
+            }
+            // Fall through to original URL
+            return try await performCDNDownload(from: urlString)
+        }
     }
 
     /// Raw CDN download without any URL rewriting.
@@ -3014,16 +3049,21 @@ class InstagramService {
             throw InstagramError.parsingError("Downloaded file is too small, likely an error page")
         }
 
-        // If the server claims it's an image, require JPEG. StorageManager hardcodes
-        // `.jpg` for all non-video media, so any other format (WebP/AVIF/PNG) would
-        // produce an unreadable file — exactly the "damaged but proper resolution"
-        // symptom seen in v1.5.12.
+        // JPEG magic-byte validation is opt-in (Settings → Advanced) since v1.7.0.
+        // When enabled, any non-JPEG image response throws so `downloadMediaData`
+        // falls back to the original (non-upgraded) URL. When disabled (default),
+        // the bytes are saved as-is — WebP/AVIF with a `.jpg` extension opens in
+        // most modern viewers anyway and is far better than a hard failure.
         if contentType.hasPrefix("image/") {
             let isJPEG = data.count >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF
             if !isJPEG {
                 let firstBytes = data.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
-                log.warn("CDN returned non-JPEG image (\(data.count) bytes, ct=\(contentType), magic=[\(firstBytes)]) url: \(String(urlString.prefix(120)))", context: "download")
-                throw InstagramError.parsingError("CDN returned \(contentType) instead of JPEG")
+                if AppSettings.shared.enableJPEGValidation {
+                    log.warn("CDN returned non-JPEG image (\(data.count) bytes, ct=\(contentType), magic=[\(firstBytes)]) url: \(String(urlString.prefix(120))) — rejecting (strict validation ON)", context: "download")
+                    throw InstagramError.parsingError("CDN returned \(contentType) instead of JPEG")
+                } else {
+                    log.info("CDN returned non-JPEG image (\(data.count) bytes, ct=\(contentType), magic=[\(firstBytes)]) — saving as-is (strict validation OFF)", context: "download")
+                }
             }
         }
 

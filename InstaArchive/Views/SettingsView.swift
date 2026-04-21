@@ -187,6 +187,11 @@ struct SettingsView: View {
                         updatesSection
                     }
 
+                    // Advanced (Diagnostics)
+                    settingsSection("Advanced (Diagnostics)") {
+                        advancedSection
+                    }
+
                     // Web Interface
                     settingsSection("Web Interface") {
                         VStack(alignment: .leading, spacing: 8) {
@@ -258,7 +263,7 @@ struct SettingsView: View {
             }
             .padding(20)
         }
-        .frame(width: 520, height: 920)
+        .frame(width: 520, height: 1000)
         .sheet(isPresented: $showingLogin) {
             InstagramLoginView()
         }
@@ -381,6 +386,50 @@ struct SettingsView: View {
         .padding(10)
         .background(accentColor.opacity(0.08))
         .cornerRadius(8)
+    }
+
+    @ViewBuilder
+    private var advancedSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Each toggle re-enables a defensive layer that was added in v1.5–v1.6 to work around Instagram blocks. v1.7 defaults them all OFF because each one also introduced its own failure mode. Flip one on only if you are debugging a specific symptom.")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Rewrite CDN URLs for higher resolution", isOn: $settings.enableCDNUpgrade)
+                Text("Strips the `stp=…_p480x480` size directive from signed CDN URLs. Often breaks the URL signature (→ 403) and burns 2× requests per image.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Reject non-JPEG image responses", isOn: $settings.enableJPEGValidation)
+                Text("Validates image bytes against the JPEG magic header. Hard-fails any CDN response that isn't JPEG (e.g. WebP). Off: save the bytes as-is.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Use cached profile metadata as fallback", isOn: $settings.enablePublicMetadataFallback)
+                Text("When feed APIs fail, falls back to the first ~12 posts cached from the profile page. No cursor pagination — will silently truncate bigger archives.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Toggle("Use strict anti-bot rate limits", isOn: $settings.useStrictRateLimit)
+                Text("Strict: 5 s base + up to 45 s jitter + depth scaling + 100 req/hour cap. Off: 3 s base + up to 5 s jitter, 500 req/hour cap (much faster).")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
     }
 
     @ViewBuilder
