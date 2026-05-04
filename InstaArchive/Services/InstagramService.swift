@@ -890,6 +890,13 @@ class InstagramService {
             if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "authenticated request error") {
                 return publicInfo
             }
+            // v1.7.1: also try page-scrape as a last resort. Previously this
+            // only ran on non-200 HTTP codes, so transient network errors
+            // (CFNetwork 310, etc.) caused the add to fail outright instead
+            // of falling through to the public profile page parser.
+            if let pageInfo = try? await fetchProfileInfoFromPage(username: username) {
+                return pageInfo
+            }
             throw error
         }
         captureClaimFromResponse(response)
@@ -909,6 +916,14 @@ class InstagramService {
                 log.warn("Authenticated profile info parse failed for @\(username), trying public metadata fallback", context: "api")
                 if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "authenticated parse failure") {
                     return publicInfo
+                }
+                // v1.7.1: also try page-scrape. Instagram's anti-bot system
+                // sometimes returns HTTP 200 with `{"status":"ok"}` and no
+                // actual data — a soft-block placeholder. The public profile
+                // page (HTML) usually still works for these profiles.
+                log.warn("Public metadata fallback unavailable for @\(username), trying page scrape fallback", context: "api")
+                if let pageInfo = try? await fetchProfileInfoFromPage(username: username) {
+                    return pageInfo
                 }
                 throw error
             }
@@ -951,6 +966,10 @@ class InstagramService {
             if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "retry request error") {
                 return publicInfo
             }
+            // v1.7.1: page-scrape last resort (matches the non-retry path).
+            if let pageInfo = try? await fetchProfileInfoFromPage(username: username) {
+                return pageInfo
+            }
             throw error
         }
 
@@ -968,6 +987,11 @@ class InstagramService {
                 log.warn("Profile info retry parse failed for @\(username), trying public metadata fallback", context: "api")
                 if let publicInfo = try await tryPublicProfileInfoFallback(username: username, after: "retry parse failure") {
                     return publicInfo
+                }
+                // v1.7.1: page-scrape last resort for soft-blocked profiles.
+                log.warn("Public metadata fallback unavailable for @\(username), trying page scrape fallback", context: "api")
+                if let pageInfo = try? await fetchProfileInfoFromPage(username: username) {
+                    return pageInfo
                 }
                 throw error
             }
