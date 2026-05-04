@@ -141,12 +141,17 @@ struct ContentView: View {
     // MARK: - Actions
 
     private func checkAll() {
-        DownloadManager.shared.checkAllProfiles(profileStore: profileStore)
+        // User-initiated: bypass the batch guard so the user can override a
+        // mid-flight scheduler batch.
+        DownloadManager.shared.checkAllProfiles(profileStore: profileStore, bypassBatchGuard: true)
     }
 
     private func syncSelected(_ ids: Set<UUID>) {
         let profiles = profileStore.profiles.filter { ids.contains($0.id) }
-        DownloadManager.shared.checkProfiles(profiles, profileStore: profileStore)
+        // User-initiated (right-click → Sync, multi-select toolbar): bypass the
+        // batch guard so a manual sync isn't silently no-op'd while the
+        // scheduler is mid-batch.
+        DownloadManager.shared.checkProfiles(profiles, profileStore: profileStore, bypassBatchGuard: true)
     }
 
     private func refreshSelected(_ ids: Set<UUID>) {

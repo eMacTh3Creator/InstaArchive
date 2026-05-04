@@ -624,7 +624,8 @@ class WebServer: ObservableObject {
         if dm.isRunning {
             self.sendJSON(connection: connection, json: ["success": true, "message": "Sync already running"])
         } else {
-            dm.checkAllProfiles(profileStore: store)
+            // User-initiated from web UI: bypass the batch guard.
+            dm.checkAllProfiles(profileStore: store, bypassBatchGuard: true)
             self.sendJSON(connection: connection, json: ["success": true, "message": "Sync started for all profiles"])
         }
     }

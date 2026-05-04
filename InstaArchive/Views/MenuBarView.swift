@@ -80,7 +80,9 @@ struct MenuBarView: View {
             // Actions
             VStack(alignment: .leading, spacing: 0) {
                 menuBarButton("Check All Now", icon: "arrow.clockwise") {
-                    downloadManager.checkAllProfiles(profileStore: profileStore)
+                    // User-initiated from menu bar: bypass the batch guard so
+                    // it works while the scheduler is mid-batch.
+                    downloadManager.checkAllProfiles(profileStore: profileStore, bypassBatchGuard: true)
                 }
                 .disabled(downloadManager.isRunning)
 

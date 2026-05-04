@@ -338,17 +338,27 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
     }
 
     /// Sync a batch of specific profiles (for multi-select).
-    func checkProfiles(_ profiles: [Profile], profileStore: ProfileStore) {
+    ///
+    /// `bypassBatchGuard` defaults to `false` so the scheduler still gets the
+    /// thundering-herd protection from v1.6.11. UI entry points (right-click
+    /// menu, multi-select toolbar, web UI) pass `true` so the user can queue
+    /// a manual sync even while the scheduler is mid-batch — without that,
+    /// right-click → Sync silently no-ops and the profile is stuck on whatever
+    /// status it had (often `.skipped` from a previous Stop).
+    func checkProfiles(_ profiles: [Profile], profileStore: ProfileStore, bypassBatchGuard: Bool = false) {
         stopAllRequested = false
         let active = activeUsernames
         let queuedProfiles = profiles.filter { !active.contains($0.username) }
         guard !queuedProfiles.isEmpty else { return }
 
-        // Don't start a second batch if one is already running — prevents the
-        // scheduler from stacking multiple concurrent waves during cooldown gaps.
-        guard !isBatchInProgress else {
-            log.info("checkProfiles: skipping — batch already in progress", context: "scheduler")
-            return
+        // Don't start a second batch if one is already running UNLESS the
+        // caller explicitly bypasses (user-initiated). The scheduler never
+        // bypasses, so concurrent waves still can't accumulate from auto-ticks.
+        if !bypassBatchGuard {
+            guard !isBatchInProgress else {
+                log.info("checkProfiles: skipping — batch already in progress", context: "scheduler")
+                return
+            }
         }
         markBatchStarted()
 
@@ -414,7 +424,9 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
             }
 
             refreshableProfiles.forEach { clearStatus(for: $0.username) }
-            checkProfiles(refreshableProfiles, profileStore: profileStore)
+            // Bypass the batch guard: refreshProfiles is always user-initiated
+            // and we already marked the batch started in the outer task above.
+            checkProfiles(refreshableProfiles, profileStore: profileStore, bypassBatchGuard: true)
         }
     }
 
@@ -756,14 +768,16 @@ final class DownloadManager: ObservableObject, @unchecked Sendable {
 
     // MARK: - Check all profiles (sequential with anti-detection)
 
-    func checkAllProfiles(profileStore: ProfileStore) {
+    func checkAllProfiles(profileStore: ProfileStore, bypassBatchGuard: Bool = false) {
         stopAllRequested = false
         let activeProfiles = profileStore.profiles.filter { $0.isActive }
         guard !activeProfiles.isEmpty else { return }
 
-        guard !isBatchInProgress else {
-            log.info("checkAllProfiles: skipping — batch already in progress", context: "scheduler")
-            return
+        if !bypassBatchGuard {
+            guard !isBatchInProgress else {
+                log.info("checkAllProfiles: skipping — batch already in progress", context: "scheduler")
+                return
+            }
         }
         markBatchStarted()
 
